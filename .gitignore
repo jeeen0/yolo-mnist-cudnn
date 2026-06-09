@@ -21,6 +21,7 @@ clips/
 # Claude 관련 파일은 깃허브에 올리지 않음
 CLAUDE.md
 .claude/
+RUN.md
 
 # 강의자료/데이터 zip 원본 (용량 큼)
 backup/
