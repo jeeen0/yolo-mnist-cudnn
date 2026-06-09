@@ -1,0 +1,32 @@
+# raw photos / generated data (large, keep out of git)
+data/raw/*/*.jpg
+data/raw/*/*.jpeg
+data/raw/*/*.png
+data/raw/*/*.JPG
+data/yolo/images/
+data/yolo/labels/
+data/yolo/data.yaml
+
+# training + runtime artifacts
+runs/
+*.pt
+*.onnx
+*.engine
+runtime/pgm/*.pgm
+runtime/results/*.csv
+finetune/weights/
+finetune/mnist_data/
+clips/
+
+# Claude 관련 파일은 깃허브에 올리지 않음
+CLAUDE.md
+.claude/
+
+# 강의자료/데이터 zip 원본 (용량 큼)
+backup/
+
+# python / os
+__pycache__/
+*.pyc
+.DS_Store
+.venv/

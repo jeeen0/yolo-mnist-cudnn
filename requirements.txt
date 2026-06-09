@@ -1,0 +1,6 @@
+# Desktop (training) + Orin (pipeline). Install per machine.
+ultralytics>=8.1.0
+opencv-python>=4.8.0
+numpy>=1.24
+# finetune (reserve) only:
+# torch / torchvision -- install the build matching your CUDA / JetPack
