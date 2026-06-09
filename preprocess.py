@@ -25,8 +25,8 @@ import cv2
 import numpy as np
 
 # ---- tuning knobs ---------------------------------------------------------
-THICKEN_FRAC = 0.045   # stroke dilation as a fraction of the digit bbox size
-CLOSE_K      = 5       # close kernel (px) to reconnect broken thin strokes
+THICKEN_FRAC = 0.025   # stroke dilation as a fraction of the digit bbox size
+CLOSE_K      = 3       # close kernel (px) to reconnect broken thin strokes
 TARGET_BOX   = 20      # digit is scaled to fit this box inside the 28 canvas
 CANVAS       = 28      # final MNIST size
 # ---------------------------------------------------------------------------

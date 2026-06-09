@@ -31,3 +31,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .venv/
+
+# compiled mnistCUDNN binary (build with: cd mnistCUDNN && make)
+mnistCUDNN/mnistCUDNN
