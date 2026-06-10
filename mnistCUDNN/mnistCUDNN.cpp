@@ -26,6 +26,11 @@
 #include <fstream>
 #include <stdlib.h>
 #include <chrono>   // PATCH 1: LATENCY_MS timer
+#include <vector>      // harness: multi-image (--dir) mode
+#include <string>
+#include <algorithm>
+#include <cstdio>
+#include <dirent.h>
 
 #include <cuda.h>  // need CUDA_VERSION
 #include <cudnn.h>
@@ -51,6 +56,12 @@ const char* ip1_bin        = "ip1.bin";
 const char* ip1_bias_bin   = "ip1.bias.bin";
 const char* ip2_bin        = "ip2.bin";
 const char* ip2_bias_bin   = "ip2.bias.bin";
+
+// Harness globals: g_quiet silences per-image verbose prints so the --dir mode
+// can emit the exact spec format; g_last_latency_ms stashes PATCH 1's in-program
+// time (MNIST only, incl. H2D/D2H/I-O) so the harness can sum it as Total Time.
+static bool   g_quiet = false;
+static double g_last_latency_ms = 0.0;
 
 /********************************************************
  * Prints the error message, and exits
@@ -712,7 +723,7 @@ class network_t {
 
         readImage(fname, imgData_h);
 
-        std::cout << "Performing forward propagation ...\n";
+        if (!g_quiet) std::cout << "Performing forward propagation ...\n";
 
         checkCudaErrors(cudaMalloc((void **)&srcData, IMAGE_H * IMAGE_W * sizeof(value_type)));
         checkCudaErrors(cudaMemcpy(srcData, imgData_h, IMAGE_H * IMAGE_W * sizeof(value_type), cudaMemcpyHostToDevice));
@@ -748,8 +759,10 @@ class network_t {
             }
         }
 
-        std::cout << "Resulting weights from Softmax:" << std::endl;
-        printDeviceVector(n * c * h * w, dstData);
+        if (!g_quiet) {
+            std::cout << "Resulting weights from Softmax:" << std::endl;
+            printDeviceVector(n * c * h * w, dstData);
+        }
 
         checkCudaErrors(cudaFree(srcData));
         checkCudaErrors(cudaFree(dstData));
@@ -758,7 +771,9 @@ class network_t {
         checkCudaErrors(cudaDeviceSynchronize());
         auto _lat_t1 = std::chrono::high_resolution_clock::now();
         double _lat_ms = std::chrono::duration<double, std::milli>(_lat_t1 - _lat_t0).count();
-        std::cout << "LATENCY_MS=" << _lat_ms << std::endl;   // parsed by scripts/04_eval.py
+        g_last_latency_ms = _lat_ms;                          // harness sums this as Total Time
+        if (!g_quiet)
+            std::cout << "LATENCY_MS=" << _lat_ms << std::endl;   // parsed by scripts/04_eval.py
 
         return id;
     }
@@ -842,6 +857,65 @@ main(int argc, char* argv[]) {
         Layer_t<float> ip2(500, 10, 1, ip2_bin, ip2_bias_bin, argv[0]);
         int i1 = mnist.classify_example(image_name, conv1, conv2, ip1, ip2);
         std::cout << "\nResult of classification: " << i1 << std::endl;
+
+        cudaDeviceReset();
+        exit(0);
+    }
+
+    // Spec test harness: classify EVERY *.pgm in a folder in ONE process and
+    // print INPUT/Result per image, then Total Images, Total Time (MNIST-only,
+    // summed in-program latency) and per-digit counts. Weights load once and
+    // the CUDA context inits once, so Total Time excludes process startup.
+    // 9-stage forward order is unchanged; this only loops over images.
+    //   ./mnistCUDNN --dir=runtime/pgm            (all images)
+    //   ./mnistCUDNN --dir=runtime/pgm --limit=15 (first 15, as the spec grades)
+    if (checkCmdLineFlag(argc, (const char**)argv, "dir")) {
+        char* dir_name;
+        getCmdLineArgumentString(argc, (const char**)argv, "dir", (char**)&dir_name);
+        int limit = 0;  // 0 = all
+        if (checkCmdLineFlag(argc, (const char**)argv, "limit"))
+            limit = getCmdLineArgumentInt(argc, (const char**)argv, "limit");
+
+        // collect *.pgm sorted by name (the pipeline's appearance/seq order)
+        std::vector<std::string> files;
+        DIR* dp = opendir(dir_name);
+        if (dp == NULL) {
+            std::cerr << "could not open dir: " << dir_name << std::endl;
+            exit(1);
+        }
+        struct dirent* de;
+        while ((de = readdir(dp)) != NULL) {
+            std::string nm = de->d_name;
+            if (nm.size() > 4 && nm.substr(nm.size() - 4) == ".pgm")
+                files.push_back(std::string(dir_name) + "/" + nm);
+        }
+        closedir(dp);
+        std::sort(files.begin(), files.end());
+        if (limit > 0 && (int)files.size() > limit) files.resize(limit);
+
+        network_t<float> mnist;
+        Layer_t<float> conv1(1, 20, 5, conv1_bin, conv1_bias_bin, argv[0]);
+        Layer_t<float> conv2(20, 50, 5, conv2_bin, conv2_bias_bin, argv[0]);
+        Layer_t<float> ip1(800, 500, 1, ip1_bin, ip1_bias_bin, argv[0]);
+        Layer_t<float> ip2(500, 10, 1, ip2_bin, ip2_bias_bin, argv[0]);
+
+        g_quiet = true;                 // emit only the spec-format lines
+        int counts[10] = {0};
+        double total_ms = 0.0;
+        for (size_t k = 0; k < files.size(); k++) {
+            int d = mnist.classify_example(files[k].c_str(), conv1, conv2, ip1, ip2);
+            std::string base = files[k];
+            size_t slash = base.find_last_of('/');
+            if (slash != std::string::npos) base = base.substr(slash + 1);
+            printf("INPUT: %s\n", base.c_str());
+            printf("Result of classification: %d\n\n", d);
+            if (d >= 0 && d < 10) counts[d]++;
+            total_ms += g_last_latency_ms;        // MNIST-only in-program time
+        }
+        printf("Total Images : %d\n", (int)files.size());
+        printf("Total Time   : %.3f sec\n\n", total_ms / 1000.0);
+        for (int d = 0; d < 10; d++)
+            printf("Digit %d : %d\n", d, counts[d]);
 
         cudaDeviceReset();
         exit(0);
