@@ -75,15 +75,20 @@ scp runs/detect/digit/weights/best.pt  <orin>:~/yolo-mnist-cudnn/best.pt
 `mnistCUDNN`이 쓰는 LeNet 가중치(`*.bin`)를, **MNIST + 우리 6/8 손글씨**로 다시 학습해
 우리 필체에 적응시킨다. 구조·레이어 순서·`.bin` 레이아웃은 예제와 **반드시 동일**(채점 제약).
 스크립트 `finetune/finetune_lenet.py`가 이 레이아웃을 그대로 맞춰 8개 `.bin`을 출력한다.
+(이 스크립트는 원본 `.bin`에서 출발해 `conv1/conv2`를 freeze하고 `ip1/ip2`만 학습하며,
+mnistCUDNN과 동일하게 LRN을 포함한다 — LRN은 가중치가 없어 출력 레이아웃은 그대로다.)
 
-> ⚠️ **1차 시도 결과(중요).** 단순 파인튜닝은 **오히려 나빴다.** 전체 세트(6:70, 8:69,
-> 전처리 0.025/3) A/B 측정: **원본 MNIST 가중치 = 95.7%(6:66/70, 8:67/69)** vs
-> **1차 파인튜닝 = 94.2%(8:65/69로 하락)** — 8을 까먹는 catastrophic forgetting.
-> 전처리가 이미 사진을 MNIST처럼 만들어 원본만으로도 높기 때문. **그래서 원본을 채택(revert).**
-> 다시 한다면 아래 B-1~B-4를 지키되, 특히: ① 학습 전처리를 배포와 동일(0.025/3),
-> ② **validation 분리**로 정직하게 측정, ③ MNIST 충분히 섞고 oversample은 낮게(x10~15)+LR 1e-4+
-> early stop, ④ `conv1/conv2` freeze하고 `ip1/ip2`만 학습(망각 방지) 고려.
-> **출하 기준: B-4 A/B에서 8≥67/69 + 1/3/5 게이트 통과 + 합계>133/139 일 때만 채택, 아니면 원본 유지.**
+> ⚠️ **1차 시도(실패) → 2차 시도(성공) 기록.**
+> **1차:** scratch 학습(random init, lr 1e-3, oversample 30, validation 없음)은 **오히려 나빴다.**
+> 전체 세트(6:70, 8:69, 전처리 0.025/3) A/B: 원본 95.7%(6:66/70, 8:67/69) vs 1차 94.2%
+> (8:65/69로 하락) — **8을 까먹는 catastrophic forgetting** → revert.
+> **2차(현재 `finetune_lenet.py`):** ① 배포와 동일 전처리(0.025/3), ② **validation 분리**,
+> ③ MNIST 섞고 oversample 낮게 + LR 1e-4 + early stop, ④ **conv1/conv2 freeze**, 추가로
+> ⑤ **train에만 영상풍 증강**(회전/스케일/이동/획두께/블러/노출/노이즈)으로 과적합 차단.
+> 정직한 강건성 측정 = held-out val에 강한 변형을 가한 **"새 영상 proxy"**:
+> **원본 59.1% → 1차(암기) 79.2% → 2차(증강) 94.6%** (clean val·1/3/5·MNIST 전체 유지, 8 망각 없음).
+> **출하 기준: 8≥67/69 + 1/3/5 게이트 + 합계>133/139 + 강건성≥원본. 단 이는 데스크탑 proxy이고,
+> 최종 채택은 반드시 Orin B-4(`04_eval.py`, 실제 바이너리+영상)로 확정한다.**
 
 ### B-1. 학습에 쓸 6/8 PGM 만들기 (런타임과 동일 전처리)
 파인튜닝은 `preprocess.py`로 정규화된 28×28 PGM을 먹는다. **런타임과 같은 `preprocess.py`
@@ -111,11 +116,14 @@ PY
 python finetune/finetune_lenet.py \
     --our-pgm-dir finetune/our_pgm \
     --out finetune/weights \
-    --epochs 5 --oversample 30
+    --epochs 15 --mult 40
 ```
-- MNIST 전체에 **우리 6/8을 oversample(x30)로 섞어** 1/3/5를 잊지 않으면서 6/8에 적응한다.
-- 6이 계속 약하면: `--oversample` ↑ (예 50), `--epochs` ↑ (예 8~10). 단 과하면 MNIST(1/3/5)를
-  잊을 수 있으니 **반드시 1/3/5 게이트로 검증**(아래).
+- 원본 `.bin`에서 출발 → `conv1/conv2` freeze → MNIST 전체에 **우리 6/8 train(증강 x40)**을 섞어
+  1/3/5를 잊지 않으면서 6/8에 적응한다. lr 1e-4, held-out val로 early stop.
+- 실행하면 **ORIG vs 파인튜닝 A/B**(clean val, robust val=새 영상 proxy, full, MNIST 1/3/5, 1/3/5 게이트)를
+  찍고, **출하 기준을 통과할 때만** `--out`에 8개 `.bin`을 쓴다(아니면 원본 유지, 미출력).
+- 노브: 6이 약하면 `--mult` ↑ / `--epochs` ↑. 증강 끄려면 `--no-aug`, conv까지 학습하려면 `--no-freeze`
+  (둘 다 과적합·망각 위험 ↑ 비권장).
 - 산출물: `finetune/weights/`에 `conv1.bin, conv1.bias.bin, conv2.bin, conv2.bias.bin,
   ip1.bin, ip1.bias.bin, ip2.bin, ip2.bias.bin` 8개.
 

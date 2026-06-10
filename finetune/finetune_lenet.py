@@ -1,156 +1,284 @@
 """
-Fine-tune a LeNet (Caffe-style) on MNIST + our 6/8 samples, then export the
-weights as the exact binary blobs mnistCUDNN loads. KEPT IN RESERVE: only run
-this if preprocessing alone doesn't get 6/8 high enough, because matching the
-binary layout is fiddly and the structure/order must NOT change.
+Fine-tune the mnistCUDNN LeNet on our 6/8 handwriting and export the 8 .bin
+blobs the example loads -- WITHOUT breaking 1/3/5 and WITHOUT overfitting.
 
-WHY the structure must match the example:
-  conv1 : 20 x 1  x 5 x 5   (+ bias 20)
-  conv2 : 50 x 20 x 5 x 5   (+ bias 50)
-  ip1   : 500 x 800         (+ bias 500)   # 800 = 50 * 4 * 4
-  ip2   : 10  x 500         (+ bias 10)
-mnistCUDNN reads conv1.bin, conv1.bias.bin, conv2.bin, conv2.bias.bin,
-ip1.bin, ip1.bias.bin, ip2.bin, ip2.bias.bin -- each a raw float32 blob in
-the order above. We replicate that layout exactly so the 9-stage forward in
-mnistCUDNN is byte-for-byte compatible (the grading constraint).
+The structure/order and the .bin layout match the example exactly (grading
+constraint): conv1(20x1x5x5) pool conv2(50x20x5x5) pool ip1(500x800) relu
+LRN ip2(10x500) softmax. We export conv1.bin, conv1.bias.bin, conv2.bin,
+conv2.bias.bin, ip1.bin, ip1.bias.bin, ip2.bin, ip2.bias.bin -- raw float32,
+that order. (The LRN has no weights, so including it changes nothing in the
+exported layout; it is kept so the training forward matches mnistCUDNN.)
 
-Pipeline:
-  - load MNIST (torchvision)
-  - load our 6/8 PGMs (already MNIST-normalized by preprocess.py) and OVERSAMPLE
-    them so the net adapts to our handwriting without forgetting 1/3/5
-  - train, then dump the 8 .bin files into --out
+WHY this recipe (the 1st attempt regressed 8 by training from scratch):
+  - INIT from the original .bin (true fine-tune, not random init)
+  - FREEZE conv1/conv2; train only ip1/ip2 -> preserves the features that
+    already nail 8, so no catastrophic forgetting
+  - mix in ALL of MNIST -> keeps 1/3/5 (and every digit) correct
+  - hold out a stratified VAL split of our 6/8 for HONEST measurement
+  - AUGMENT the train split on the fly (rotation/scale/shift/thickness/blur/
+    exposure/noise) so it generalizes to unseen video instead of memorizing
+    the ~139 photos. Robustness is measured on a PERTURBED val ("new-video
+    proxy") so memorization can't hide.
+  - low lr (1e-4) + early stop on robustness, keeping 8 and the 1/3/5 gate
 
-  python finetune/finetune_lenet.py --our-pgm-dir runtime/pgm --out finetune/weights
+Ship gate (adopt only if): 1/3/5 sample gate passes AND our 8 >= 67/69 AND
+total > 133/139 AND robustness >= original. Final decision is still made on the
+Orin via scripts/04_eval.py (real binary + video pipeline) -- this is a proxy.
 
-Then copy the 8 .bin files over mnistCUDNN's weight files and rebuild nothing
-(weights are loaded at runtime). KEEP A BACKUP of the original .bin first.
+  python finetune/finetune_lenet.py --our-pgm-dir finetune/our_pgm --out finetune/weights
 """
-
 import os
-import csv
 import glob
 import argparse
 
 import numpy as np
-
+import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, ConcatDataset, TensorDataset
+from torch.utils.data import DataLoader, ConcatDataset, TensorDataset, Dataset
 from torchvision import datasets, transforms
+
+# (name, shape) in the exact order/layout the example stores them.
+WEIGHTS = [
+    ("conv1.bin", (20, 1, 5, 5)), ("conv1.bias.bin", (20,)),
+    ("conv2.bin", (50, 20, 5, 5)), ("conv2.bias.bin", (50,)),
+    ("ip1.bin", (500, 800)), ("ip1.bias.bin", (500,)),
+    ("ip2.bin", (10, 500)), ("ip2.bias.bin", (10,)),
+]
 
 
 class LeNet(nn.Module):
-    """Same shape as the Caffe LeNet mnistCUDNN ships with."""
+    """Faithful to mnistCUDNN's 9-stage forward (incl. the LRN after ip1+relu)."""
 
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 20, 5)      # 28 -> 24
-        self.conv2 = nn.Conv2d(20, 50, 5)     # 12 -> 8
-        self.ip1 = nn.Linear(50 * 4 * 4, 500)
+        self.conv1 = nn.Conv2d(1, 20, 5)
+        self.conv2 = nn.Conv2d(20, 50, 5)
+        self.ip1 = nn.Linear(800, 500)
         self.ip2 = nn.Linear(500, 10)
+        self.lrn = nn.LocalResponseNorm(5, alpha=1e-4, beta=0.75, k=1.0)
 
     def forward(self, x):
-        x = F.max_pool2d(self.conv1(x), 2)    # 24 -> 12
-        x = F.max_pool2d(self.conv2(x), 2)    # 8  -> 4
-        x = x.view(x.size(0), -1)
+        x = F.max_pool2d(self.conv1(x), 2)
+        x = F.max_pool2d(self.conv2(x), 2)
+        x = x.flatten(1)
         x = F.relu(self.ip1(x))
+        x = self.lrn(x.unsqueeze(-1).unsqueeze(-1)).flatten(1)
         return self.ip2(x)
 
 
-def read_pgm(path):
-    """Read a binary P5 PGM into a float32 [0,1] (28,28) array."""
-    with open(path, "rb") as f:
-        assert f.readline().strip() == b"P5"
-        dims = f.readline().split()
-        w, h = int(dims[0]), int(dims[1])
-        f.readline()  # maxval
-        data = np.frombuffer(f.read(w * h), dtype=np.uint8)
-    return data.reshape(h, w).astype(np.float32) / 255.0
+def _lb(path, shape):
+    a = np.fromfile(path, dtype="<f4")
+    n = int(np.prod(shape))
+    if a.size != n:
+        raise SystemExit(f"[ft] {os.path.basename(path)}: expected {n} floats, "
+                         f"got {a.size} -> layout mismatch, STOP.")
+    return torch.from_numpy(a.reshape(shape).copy())
 
 
-def load_our_digits(pgm_dir):
-    """Load our PGMs whose filename starts with the true label digit."""
-    xs, ys = [], []
-    for p in sorted(glob.glob(os.path.join(pgm_dir, "*.pgm"))):
-        name = os.path.basename(p)
-        if not name[0].isdigit():
-            continue
-        label = int(name[0])
-        xs.append(read_pgm(p))
-        ys.append(label)
-    if not xs:
-        return None
-    x = torch.tensor(np.stack(xs)).unsqueeze(1)         # (N,1,28,28)
-    y = torch.tensor(ys, dtype=torch.long)
-    return TensorDataset(x, y)
-
-
-def dump_bin(tensor, path):
-    """Write a tensor as a raw little-endian float32 blob."""
-    tensor.detach().cpu().numpy().astype("<f4").tofile(path)
+def load_original(model, bin_dir):
+    g = {n: _lb(os.path.join(bin_dir, n), s) for n, s in WEIGHTS}
+    model.load_state_dict({
+        "conv1.weight": g["conv1.bin"], "conv1.bias": g["conv1.bias.bin"],
+        "conv2.weight": g["conv2.bin"], "conv2.bias": g["conv2.bias.bin"],
+        "ip1.weight": g["ip1.bin"], "ip1.bias": g["ip1.bias.bin"],
+        "ip2.weight": g["ip2.bin"], "ip2.bias": g["ip2.bias.bin"]})
 
 
 def export_weights(model, out_dir):
     os.makedirs(out_dir, exist_ok=True)
-    pairs = [
-        ("conv1.bin", model.conv1.weight), ("conv1.bias.bin", model.conv1.bias),
-        ("conv2.bin", model.conv2.weight), ("conv2.bias.bin", model.conv2.bias),
-        ("ip1.bin", model.ip1.weight),     ("ip1.bias.bin", model.ip1.bias),
-        ("ip2.bin", model.ip2.weight),     ("ip2.bias.bin", model.ip2.bias),
-    ]
-    for fname, t in pairs:
-        dump_bin(t, os.path.join(out_dir, fname))
-    print("wrote 8 .bin files to", out_dir)
-    print("  back up the originals before overwriting mnistCUDNN's weights!")
+    m = {"conv1.bin": model.conv1.weight, "conv1.bias.bin": model.conv1.bias,
+         "conv2.bin": model.conv2.weight, "conv2.bias.bin": model.conv2.bias,
+         "ip1.bin": model.ip1.weight, "ip1.bias.bin": model.ip1.bias,
+         "ip2.bin": model.ip2.weight, "ip2.bias.bin": model.ip2.bias}
+    for name, _ in WEIGHTS:
+        m[name].detach().cpu().numpy().astype("<f4").tofile(os.path.join(out_dir, name))
+    print(f"wrote 8 .bin files to {out_dir}  (back up the originals first!)")
+
+
+def read_pgm(path):
+    """Binary P5 reader tolerant of comment (#) lines -> float32 [0,1] (28,28)."""
+    with open(path, "rb") as f:
+        assert f.readline().strip() == b"P5"
+        vals = []
+        while len(vals) < 3:                       # width, height, maxval
+            line = f.readline()
+            if line.startswith(b"#"):
+                continue
+            vals += line.split()
+        w, h = int(vals[0]), int(vals[1])
+        return np.frombuffer(f.read(w*h), np.uint8).reshape(h, w).astype(np.float32)/255.0
+
+
+def load_our(pgm_dir):
+    """Our PGMs whose filename starts with the true label digit -> {label:[arr]}."""
+    by = {}
+    for p in sorted(glob.glob(os.path.join(pgm_dir, "*.pgm"))):
+        c = os.path.basename(p)[0]
+        if c.isdigit():
+            by.setdefault(int(c), []).append(read_pgm(p))
+    return by
+
+
+def augment(img01, rng, strong=False):
+    """Video-style perturbation of a 28x28 white-on-black [0,1] image."""
+    s = 1.4 if strong else 1.0
+    ang = rng.uniform(-14*s, 14*s)
+    sc = rng.uniform(1 - 0.18*s, 1 + 0.18*s)
+    M = cv2.getRotationMatrix2D((14, 14), ang, sc)
+    M[0, 2] += rng.uniform(-2.5*s, 2.5*s); M[1, 2] += rng.uniform(-2.5*s, 2.5*s)
+    out = cv2.warpAffine(img01, M, (28, 28), flags=cv2.INTER_LINEAR, borderValue=0.0)
+    r = rng.random()
+    if r < 0.30:
+        out = cv2.dilate(out, np.ones((2, 2), np.float32))
+    elif r < 0.50:
+        out = cv2.erode(out, np.ones((2, 2), np.float32))
+    if rng.random() < 0.4:
+        k = int(rng.choice([3, 5])); out = cv2.GaussianBlur(out, (k, k), 0)
+    out = out * rng.uniform(0.75, 1.25)
+    if rng.random() < 0.4:
+        out = out + rng.normal(0, 0.06, out.shape).astype(np.float32)
+    return np.clip(out, 0, 1).astype(np.float32)
+
+
+class AugOurs(Dataset):
+    """Our 6/8 train images, returned freshly augmented every access."""
+    def __init__(self, xs, ys, mult, augment_on=True):
+        self.xs, self.ys, self.mult, self.on = xs, ys, mult, augment_on
+        self.rng = np.random.default_rng(0)
+
+    def __len__(self):
+        return len(self.xs) * self.mult
+
+    def __getitem__(self, i):
+        j = i % len(self.xs)
+        a = augment(self.xs[j], self.rng) if self.on else self.xs[j]
+        return torch.tensor(a)[None], torch.tensor(self.ys[j], dtype=torch.long)
+
+
+def make_perturbed(xs, ys, k, seed):
+    rng = np.random.default_rng(seed)
+    X, Y = [], []
+    for img, lab in zip(xs, ys):
+        for _ in range(k):
+            X.append(augment(img, rng, strong=True)); Y.append(lab)
+    return torch.tensor(np.stack(X))[:, None], torch.tensor(Y)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--our-pgm-dir", default="runtime/pgm")
+    ap.add_argument("--bin-dir", default="mnistCUDNN/data", help="original .bin to init from")
+    ap.add_argument("--our-pgm-dir", default="finetune/our_pgm")
     ap.add_argument("--out", default="finetune/weights")
-    ap.add_argument("--epochs", type=int, default=5)
-    ap.add_argument("--oversample", type=int, default=30,
-                    help="repeat our 6/8 set N times so the net adapts")
+    ap.add_argument("--epochs", type=int, default=15)
+    ap.add_argument("--mult", type=int, default=40, help="augmented copies of our train set")
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--val-frac", type=float, default=0.25)
     ap.add_argument("--data", default="finetune/mnist_data")
+    ap.add_argument("--no-aug", action="store_true", help="disable augmentation")
+    ap.add_argument("--no-freeze", action="store_true", help="train conv layers too")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.chdir(root)
-
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    tf = transforms.Compose([transforms.ToTensor()])
-    mnist = datasets.MNIST(args.data, train=True, download=True, transform=tf)
 
-    sets = [mnist]
-    ours = load_our_digits(args.our_pgm_dir)
-    if ours is not None:
-        sets += [ours] * args.oversample
-        print(f"mixing in {len(ours)} of our digits, oversampled x{args.oversample}")
-    else:
-        print("no our-digit PGMs found; training on plain MNIST only")
+    if not all(os.path.exists(os.path.join(args.bin_dir, n)) for n, _ in WEIGHTS):
+        raise SystemExit(f"[ft] original .bin not found in {args.bin_dir}. "
+                         f"Point --bin-dir at mnistCUDNN/data.")
 
-    loader = DataLoader(ConcatDataset(sets), batch_size=128, shuffle=True)
+    # stratified train/val split of our 6/8
+    by = load_our(args.our_pgm_dir)
+    if not by:
+        raise SystemExit(f"[ft] no labeled PGMs in {args.our_pgm_dir} "
+                         f"(expected 6_*.pgm / 8_*.pgm). Run B-1 first.")
+    tr_x, tr_y, va_x, va_y = [], [], [], []
+    for lab, arrs in by.items():
+        idx = np.random.permutation(len(arrs)); nval = int(len(arrs)*args.val_frac)
+        for j, k in enumerate(idx):
+            (va_x if j < nval else tr_x).append(arrs[k])
+            (va_y if j < nval else tr_y).append(lab)
+    full = {lab: torch.tensor(np.stack(a))[:, None].to(dev) for lab, a in by.items()}
+    vaX = torch.tensor(np.stack(va_x))[:, None].to(dev); vaY = torch.tensor(va_y)
+    pX, pY = make_perturbed(va_x, va_y, k=12, seed=123); pX = pX.to(dev)
+    print(f"[ft] our split: train {len(tr_y)} / val {len(va_y)} ; perturbed-val {len(pY)} "
+          f"| aug={'off' if args.no_aug else 'on'} freeze_conv={not args.no_freeze}")
 
-    model = LeNet().to(dev)
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    mnist = datasets.MNIST(args.data, train=True, download=True,
+                           transform=transforms.ToTensor(),
+                           target_transform=lambda y: torch.tensor(y, dtype=torch.long))
+    our_tr = AugOurs(tr_x, tr_y, args.mult, augment_on=not args.no_aug)
+    loader = DataLoader(ConcatDataset([mnist, our_tr]), batch_size=128, shuffle=True)
+
+    sample = [(read_pgm(os.path.join(args.bin_dir, f"{n}_28x28.pgm")), l)
+              for n, l in [("one", 1), ("three", 3), ("five", 5)]]
+    mtest = datasets.MNIST(args.data, train=False, download=True, transform=transforms.ToTensor())
+    MX = torch.stack([mtest[i][0] for i in range(len(mtest))]).to(dev)
+    MY = torch.tensor([mtest[i][1] for i in range(len(mtest))])
+
+    def perlab(m, X, Y, lab):
+        m.eval()
+        with torch.no_grad():
+            p = m(X).argmax(1).cpu()
+        msk = Y == lab; return int((p[msk] == lab).sum()), int(msk.sum())
+    def macc(m, d):
+        m.eval()
+        with torch.no_grad():
+            return (m(MX[MY == d]).argmax(1).cpu() == d).float().mean().item()
+    def gate(m):
+        m.eval()
+        with torch.no_grad():
+            return all(int(m(torch.tensor(im)[None, None].to(dev)).argmax(1)) == l
+                       for im, l in sample)
+    def report(tag, m):
+        cv6, _ = perlab(m, vaX, vaY, 6); cv8, _ = perlab(m, vaX, vaY, 8)
+        pv6, pn6 = perlab(m, pX, pY, 6); pv8, pn8 = perlab(m, pX, pY, 8)
+        f6c, f6n = perlab(m, full[6], torch.full((full[6].shape[0],), 6), 6)
+        f8c, f8n = perlab(m, full[8], torch.full((full[8].shape[0],), 8), 8)
+        rob = (pv6 + pv8) / (pn6 + pn8)
+        print(f"[{tag}] cleanVal 6={cv6} 8={cv8} | robustVal {rob*100:.1f}% | "
+              f"full 6={f6c}/{f6n} 8={f8c}/{f8n} | "
+              f"MNIST135={macc(m,1):.3f}/{macc(m,3):.3f}/{macc(m,5):.3f} gate={gate(m)}")
+        return rob, f6c + f8c, f8c, gate(m)
+
+    print("\n=== baseline (ORIGINAL weights) ===")
+    orig = LeNet().to(dev); load_original(orig, args.bin_dir)
+    rob0, _, _, _ = report("ORIG", orig)
+
+    print("\n=== fine-tune ===")
+    model = LeNet().to(dev); load_original(model, args.bin_dir)
+    if not args.no_freeze:
+        for p in list(model.conv1.parameters()) + list(model.conv2.parameters()):
+            p.requires_grad = False
+    opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=args.lr)
+
+    best = None
     for ep in range(args.epochs):
         model.train()
-        tot, corr, loss_sum = 0, 0, 0.0
         for x, y in loader:
             x, y = x.to(dev), y.to(dev)
-            opt.zero_grad()
-            out = model(x)
-            loss = F.cross_entropy(out, y)
-            loss.backward()
-            opt.step()
-            loss_sum += loss.item() * y.size(0)
-            corr += (out.argmax(1) == y).sum().item()
-            tot += y.size(0)
-        print(f"epoch {ep + 1}/{args.epochs}  loss {loss_sum / tot:.4f}  "
-              f"acc {corr / tot:.4f}")
+            opt.zero_grad(); F.cross_entropy(model(x), y).backward(); opt.step()
+        rob, tot, f8c, g = report(f"ep{ep+1:2d}", model)
+        score = (g and f8c >= 67, rob)          # keep 8 + gate, then maximize robustness
+        if best is None or score > best[0]:
+            best = (score, {k: v.detach().clone() for k, v in model.state_dict().items()},
+                    (rob, tot, f8c, g))
+    model.load_state_dict(best[1])
+    rob, tot, f8c, g = best[2]
 
-    export_weights(model, args.out)
+    print("\n=== verdict ===")
+    print(f"robustness(perturbed-val): ORIG {rob0*100:.1f}%  ->  fine-tuned {rob*100:.1f}%")
+    ship = g and f8c >= 67 and tot > 133 and rob >= rob0
+    if ship:
+        export_weights(model, args.out)
+        print(f"[ft] ADOPT (proxy) ✓  total={tot}/139  8={f8c}/69  gate={g}  rob>=orig")
+        print( "     -> scp the 8 .bin to the Orin and confirm with scripts/04_eval.py (B-4).")
+    else:
+        print(f"[ft] REJECT ✗ keep ORIGINAL (need gate & 8>=67 & total>133 & rob>=orig; "
+              f"got gate={g} 8={f8c} total={tot} rob={rob:.3f} vs {rob0:.3f}). No .bin written.")
 
 
 if __name__ == "__main__":
