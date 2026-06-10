@@ -15,7 +15,14 @@ runs/
 runtime/pgm/*.pgm
 runtime/results/*.csv
 finetune/weights/
+finetune/weights_v3/
 finetune/mnist_data/
+finetune/mnist/
+finetune/our_pgm/
+finetune/data68/
+finetune/extra/
+mnistCUDNN/data/*.orig
+data/yolo/preview/
 clips/
 
 # Claude 관련 파일은 깃허브에 올리지 않음
