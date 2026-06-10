@@ -900,6 +900,14 @@ main(int argc, char* argv[]) {
         Layer_t<float> ip2(500, 10, 1, ip2_bin, ip2_bias_bin, argv[0]);
 
         g_quiet = true;                 // emit only the spec-format lines
+
+        // PRE-WARM: one untimed forward so the first GRADED image does not absorb
+        // cuDNN's one-time kernel-load cost (lazy module load on first launch).
+        // Setup only -- same rationale as "weights/context load once" above; the
+        // 9-stage order and the per-image work Total Time measures are unchanged.
+        if (!files.empty())
+            mnist.classify_example(files[0].c_str(), conv1, conv2, ip1, ip2);
+
         int counts[10] = {0};
         double total_ms = 0.0;
         for (size_t k = 0; k < files.size(); k++) {

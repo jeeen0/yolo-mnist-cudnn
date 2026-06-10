@@ -49,19 +49,33 @@ def digit_mask(gray):
 
 
 def digit_bbox(mask):
-    """Return (x, y, w, h) of the largest foreground component, or None.
+    """Return (x, y, w, h) of the digit's foreground component, or None.
 
-    The largest connected component is the digit; tiny specks (dust, paper
-    edge) are ignored. This same bbox is reused to write YOLO labels.
+    The digit is the largest component that does NOT touch the crop border.
+    On clean paper photos the digit is already the largest blob, but on video
+    frames a phone bezel / glare strip along the edge becomes a big bright
+    region after INV-threshold and out-sizes the thin digit stroke; those
+    strips hug the border, so we drop border-touching components first and
+    fall back to the global largest only if nothing sits fully inside.
+    This same bbox is reused to write YOLO labels.
     """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
                                cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    c = max(cnts, key=cv2.contourArea)
-    if cv2.contourArea(c) < 20:          # reject noise-only frames
+    H, W = mask.shape
+
+    def touches_border(b):
+        x, y, w, h = b
+        return x <= 1 or y <= 1 or (x + w) >= (W - 1) or (y + h) >= (H - 1)
+
+    scored = [(cv2.contourArea(c), cv2.boundingRect(c)) for c in cnts]
+    inside = [t for t in scored if not touches_border(t[1])]
+    pool = inside if inside else scored
+    area, box = max(pool, key=lambda t: t[0])
+    if area < 20:                        # reject noise-only frames
         return None
-    return cv2.boundingRect(c)
+    return box
 
 
 def _center_of_mass_shift(img28):
