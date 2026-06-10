@@ -25,8 +25,7 @@ mnistCUDNN/data/*.orig
 data/yolo/preview/
 clips/
 
-# Claude 관련 파일은 깃허브에 올리지 않음
-CLAUDE.md
+# Claude 관련 파일 (CLAUDE.md는 프로젝트 brain이라 이제 깃에 포함)
 .claude/
 RUN.md
 
