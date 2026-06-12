@@ -62,8 +62,11 @@ collected '6' and '8' samples recognized.
 - `scripts/01_make_dataset.py` — auto-label photos -> YOLO dataset.
 - `scripts/02_train_yolo.py` — train + export (DESKTOP GPU).
 - `scripts/03_pipeline.py` — video -> YOLO -> crop -> 28x28 PGM (Orin); ONE PGM
-  per digit appearance (gap- OR box-center-jump segmentation; most-centered frame).
+  per digit appearance (gap- OR box-center-jump segmentation; composite frame-pick
+  = centeredness + conf + box-height + ink-fraction guard).
 - `scripts/04_eval.py` — classify PGMs, per-digit accuracy + latency, 1/3/5 gate.
+- `scripts/gen_test_clip.py` — synthesize a multi-digit pan test clip from the 6/8
+  photos (continuous paper-gray strip, pitch~frame-width); writes a `.labels.txt`.
 - `finetune/finetune_lenet.py` — fine-tune LeNet -> 8 `.bin` (init from original,
   freeze conv1/conv2, augment our 6/8, ship gate). `finetune/eval_extra.py` —
   OOD check on USPS/EMNIST/ARDIS.
@@ -98,20 +101,44 @@ several repeats and report the median (warmup-robust).
 - Full patch instructions with exact spots: `docs/mnistCUDNN_patch_guide.md`.
 
 ## Latency levers (in priority order, all leave the 9 stages intact)
-1. Add `LATENCY_MS=` timer (patch 1) — required to even have a score.
-2. Hardcode conv algorithm, skip the per-run search (patch 2) — biggest win.
-3. Run ONE precision, not both FP32+FP16 (patch 3) — measure which is faster.
-4. (reserve) reuse handles/buffers, pinned memory (patch 4) — for multi-image.
+1. Add `LATENCY_MS=` timer (patch 1) — required to even have a score. DONE.
+2. Hardcode conv algorithm, skip the per-run search (patch 2) — biggest win. DONE.
+3. Run ONE precision, not both FP32+FP16 (patch 3) — `--dir` path is already FP32-only
+   per image; both-precision only runs in the no-arg self-test (not scored). N/A.
+4. Reuse buffers/workspace across images (patch 4) — DONE. grow-only `resize()` +
+   persistent ping-pong + conv workspace; ~20 cudaMalloc/Free per image removed.
+   Cumulative `--dir` latency ladder (139 imgs, measured): algo-search+no-prewarm
+   2.94s -> +algo-hardcode 0.71s -> +pre-warm 0.39s -> +buffer-reuse 0.28s = 10.5x.
 
-## Current status (desktop work done; Orin validation pending)
-- `02` -> `best.pt` (single-class digit detector, mAP50 ~0.995). Engine builds on Orin.
-- Fine-tune done: `finetune/weights/*.bin` (v3 = init-from-original + conv freeze +
-  augmentation). Proxy + OOD (USPS/EMNIST/ARDIS): 6 improves everywhere, 8 mostly,
-  1/3/5 preserved. NOT yet applied to `mnistCUDNN/data` — Orin backs up + swaps + 04 gate.
-- `03` appearance-dedup validated on `clips/number.mp4`: 4 appearances -> 4 PGMs
-  reading 5,6,5,6. Thresholds (`--gap/--jump/--conf`) tuned to that clip.
-- `mnistCUDNN.cpp` patched (LATENCY_MS, hardcoded algo, `--dir` harness). NOT yet
-  compiled here (no cuDNN on desktop) — Orin `make` is the real check.
+## Current status (Orin-validated through 2026-06-12)
+- `02` -> `best.pt` (single-class digit detector, mAP50 ~0.995). YOLO runs on CPU here
+  (torch has no CUDA), so the pipeline uses `--weights best.pt`, not `.engine`.
+- Weights: v2 fine-tune is LIVE in `mnistCUDNN/data/*.bin` (committed 82716be). A/B on
+  our 139 photos (guard preprocess, real binary): original MNIST = 135/139, v2 = 138/139
+  (6: 67->70/70, 8: 68/69), 1/3/5 and the official video unaffected. Original .bin kept
+  in `~/cudnn_samples_v9/mnistCUDNN/data/`.
+- mnistCUDNN: PATCH 1-4 all DONE and compiled (`make`). `--dir` ~1.8-2.0 ms/img.
+- preprocess: `digit_mask` now CLAHE + flood-guard (was plain Otsu). Fixes faint/lossy
+  VIDEO strokes that used to collapse to a white box and read as 1.
+- `03`: appearance-dedup + composite frame-pick (centeredness+conf+box-height+ink-guard).
+- **VIDEOS**: `clips/number.mp4` (5,6,5,6) and the professor's OFFICIAL lab clip
+  `clips/number (1).mp4` (1080x1920 60fps, 5,6,5,6). Only 5/6 — no real 8 video yet.
+  `scripts/gen_test_clip.py` synthesizes multi-digit clips (incl. 8) from our 6/8 photos.
+- **End-to-end results (this pipeline):** official video 4 appearances -> 4 PGMs ->
+  5,6,5,6 = 4/4, 0.011s; synthetic 14-digit clip 14/14 count, 13/14 classify;
+  6/8 photos 138/139; 1/3/5 gate pass.
+- Uncommitted: `scripts/03_pipeline.py` (frame-pick). Committed this session: e00b65c
+  (PATCH4 + CLAHE-guard + gen_test_clip.py), on origin.
+
+## NEXT: EMNIST fine-tune (desktop, planned)
+Goal: lift video-path robustness further (esp. the faint 6 and untested 8 on video).
+- Most-similar training data is OUR OWN digits put THROUGH the video path (lossy crops)
+  + video-degradation augmentation; public sets are auxiliary only.
+- EMNIST-digits (`torchvision EMNIST split=digits`, 28x28, 240k, **transpose to upright**)
+  is the best public add for handwriting diversity — mix it as a REGULARIZER alongside
+  our data, not alone. QMNIST ~= MNIST (no new signal). USPS/ARDIS/DIDA: OOD TEST ONLY.
+- HARD rules unchanged: init from original .bin, **freeze conv1/conv2** (only ip1/ip2),
+  honor the 1/3/5 gate, back up `.bin`, A/B + ship-gate before swapping on the Orin.
 
 ## Done criteria
 - `01` builds the dataset; `02` produces `best.pt`; Orin builds `best.engine`.
@@ -123,8 +150,9 @@ several repeats and report the median (warmup-robust).
   `runtime/results/results.csv`).
 
 ## Work loop (self-correct)
-1. `python scripts/03_pipeline.py --video clips/<clip>.mp4 --weights best.engine`
+1. `python scripts/03_pipeline.py --video clips/<clip>.mp4 --weights best.pt`
    -> one PGM per appearance in `runtime/pgm`. Sanity-check the count == digits shown.
+   (YOLO is CPU here; high-fps clips: add `--stride 2/4`. best.engine unavailable.)
 2. `./mnistCUDNN/mnistCUDNN --dir=runtime/pgm --limit=<#digits>` for the spec output;
    `scripts/04_eval.py` for the 1/3/5 gate + per-digit/latency table.
 3. If a digit misclassifies -> tune `preprocess.py` knobs or re-run the fine-tune.
