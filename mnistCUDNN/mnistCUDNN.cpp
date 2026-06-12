@@ -31,6 +31,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <dirent.h>
+#include <map>        // PATCH 4: per-pointer capacity map for grow-only resize
 
 #include <cuda.h>  // need CUDA_VERSION
 #include <cudnn.h>
@@ -396,6 +397,17 @@ class network_t {
     cudnnLRNDescriptor_t normDesc;
     cublasHandle_t cublasHandle;
 
+    // PATCH 4: persistent device buffers so per-image work allocates nothing.
+    // resize() becomes grow-only (high-water mark) keyed by pointer, the conv
+    // workspace is allocated once and reused, and the src/dst ping-pong buffers
+    // survive across images. Eliminates ~20 cudaMalloc/cudaFree per image (each
+    // device-synchronizing and slow on Orin) without touching the 9-stage path.
+    std::map<value_type*, size_t> m_cap;   // live buffer -> capacity in bytes
+    void*  m_workSpace    = NULL;          // reused conv workspace
+    size_t m_workSpaceCap = 0;             // its capacity in bytes
+    value_type* m_srcData = NULL;          // ping-pong buffer A (persists)
+    value_type* m_dstData = NULL;          // ping-pong buffer B (persists)
+
     void
     createHandles() {
         checkCUDNN(cudnnCreate(&cudnnHandle));
@@ -449,14 +461,34 @@ class network_t {
         createHandles();
     };
 
-    ~network_t() { destroyHandles(); }
+    ~network_t() {
+        // PATCH 4: free the persistent buffers (capacity map keys are these ptrs)
+        for (auto& kv : m_cap) {
+            if (kv.first != NULL) cudaFree(kv.first);
+        }
+        m_cap.clear();
+        if (m_workSpace != NULL) cudaFree(m_workSpace);
+        destroyHandles();
+    }
 
+    // PATCH 4: grow-only resize. Reuse the existing allocation when it is already
+    // big enough (the steady state after the first image); only (re)allocate when
+    // a larger buffer is needed. Same post-condition as before for callers: *data
+    // points to a buffer of at least `size` elements. cudnn writes with beta=0 and
+    // reads dims from descriptors, so a larger-than-needed buffer is harmless.
     void
     resize(int size, value_type** data) {
+        size_t need = (size_t)size * sizeof(value_type);
         if (*data != NULL) {
+            auto it = m_cap.find(*data);
+            if (it != m_cap.end() && it->second >= need) {
+                return;                       // big enough -> reuse, no malloc
+            }
             checkCudaErrors(cudaFree(*data));
+            if (it != m_cap.end()) m_cap.erase(it);
         }
-        checkCudaErrors(cudaMalloc((void **)data, size * sizeof(value_type)));
+        checkCudaErrors(cudaMalloc((void **)data, need));
+        m_cap[*data] = need;
     }
 
     void
@@ -595,7 +627,13 @@ class network_t {
         checkCUDNN(cudnnGetConvolutionForwardWorkspaceSize(
             cudnnHandle, srcTensorDesc, filterDesc, convDesc, dstTensorDesc, algo, &sizeInBytes));
         if (sizeInBytes != 0) {
-            checkCudaErrors(cudaMalloc(&workSpace, sizeInBytes));
+            // PATCH 4: reuse one grow-only workspace instead of malloc/free per conv
+            if (sizeInBytes > m_workSpaceCap) {
+                if (m_workSpace != NULL) checkCudaErrors(cudaFree(m_workSpace));
+                checkCudaErrors(cudaMalloc(&m_workSpace, sizeInBytes));
+                m_workSpaceCap = sizeInBytes;
+            }
+            workSpace = m_workSpace;
         }
         scaling_type alpha = scaling_type(1);
         scaling_type beta  = scaling_type(0);
@@ -613,9 +651,7 @@ class network_t {
                                            dstTensorDesc,
                                            *dstData));
         addBias(dstTensorDesc, conv, c, *dstData);
-        if (sizeInBytes != 0) {
-            checkCudaErrors(cudaFree(workSpace));
-        }
+        // PATCH 4: workspace is persistent (m_workSpace) -> no per-conv free
     }
 
     void
@@ -718,14 +754,16 @@ class network_t {
         auto _lat_t0 = std::chrono::high_resolution_clock::now();
 
         int n = 0, c = 0, h = 0, w = 0;
-        value_type *srcData = NULL, *dstData = NULL;
+        // PATCH 4: reuse the persistent ping-pong buffers across images.
+        value_type *srcData = m_srcData, *dstData = m_dstData;
         value_type imgData_h[IMAGE_H * IMAGE_W] = {};
 
         readImage(fname, imgData_h);
 
         if (!g_quiet) std::cout << "Performing forward propagation ...\n";
 
-        checkCudaErrors(cudaMalloc((void **)&srcData, IMAGE_H * IMAGE_W * sizeof(value_type)));
+        // grow-only: allocates on the first image only, reuses afterwards
+        resize(IMAGE_H * IMAGE_W, &srcData);
         checkCudaErrors(cudaMemcpy(srcData, imgData_h, IMAGE_H * IMAGE_W * sizeof(value_type), cudaMemcpyHostToDevice));
 
         n = c = 1;
@@ -764,8 +802,10 @@ class network_t {
             printDeviceVector(n * c * h * w, dstData);
         }
 
-        checkCudaErrors(cudaFree(srcData));
-        checkCudaErrors(cudaFree(dstData));
+        // PATCH 4: buffers persist across images -> no per-image free. Store the
+        // (possibly swapped) ping-pong pointers back so the next call reuses them.
+        m_srcData = srcData;
+        m_dstData = dstData;
 
         // PATCH 1: GPU is async — wait for completion, then report in-program latency.
         checkCudaErrors(cudaDeviceSynchronize());
