@@ -27,9 +27,13 @@ python live/live_demo.py --manual
 # 카메라가 1번이거나 CPU YOLO가 버벅이면
 python live/live_demo.py --cam 1 --stride 2 --cam-w 960 --cam-h 540
 
-# 시작 전에 이전 PGM 비우기
-python live/live_demo.py --fresh
+# 이전 PGM을 지우지 않고 누적하고 싶을 때 (기본은 시작 시 자동 비움)
+python live/live_demo.py --keep
 ```
+
+> 기본 동작: 시작할 때 out 폴더(`runtime/live_pgm`)의 기존 PGM을 **자동으로 비웁니다.**
+> 안 그러면 이전 실행분이 쌓여서, 6개만 보여줬는데 종료 시 `--dir`가 폴더 전체(예: 180장)
+> 를 세버립니다. 누적이 필요하면 `--keep`.
 
 ## appearance 분할 = 갭 OR 점프 OR **숫자 내용 변화**
 라이브에선 들고 있는 숫자를 드문드문(`--live-every`, 기본 5프레임마다) 분류해서,
@@ -60,7 +64,7 @@ python live/live_demo.py --fresh
 매 프레임 분류하면 한 숫자를 들고 있어도 분류가 순간순간 튑니다(블러/흔들림으로
 6→8→6). "연속 N회 같으면 전환" 방식은 이 튐만으로 새 appearance를 만들어 **한 숫자가
 여러 장** 저장됩니다. 그래서 **슬라이딩 윈도우 다수결**을 씁니다: 최근 `--vote-window`
-(7) 프레임 중 *다른* 숫자가 `--need-change`(5)표 이상 **지속적으로** 우세할 때만 분할.
+(7) 프레임 중 *다른* 숫자가 `--need-change`(6)표 이상 **지속적으로** 우세할 때만 분할.
 순간 튐(1~2프레임)은 무시되고 진짜 재작성만 잡힙니다. 화면 숫자도 다수결 결과라 흔들리지
 않습니다.
 
@@ -86,11 +90,11 @@ python live/live_demo.py --fresh
 | `--gap` / `--jump` | `8` / `0.35` | appearance 분할 기준 (갭/점프) |
 | `--live-every` | `1` | 들고 있는 숫자 재분류 주기(프레임). 1=매 프레임(데몬이라 저렴) |
 | `--vote-window` | `7` | 다수결 슬라이딩 윈도우 크기(프레임) |
-| `--need-change` | `5` | 새 숫자로 분할에 필요한 윈도우 내 득표수(↑하면 한 숫자가 덜 쪼개짐) |
+| `--need-change` | `6` | 새 숫자로 분할에 필요한 윈도우 내 득표수(↑하면 한 숫자가 덜 쪼개짐) |
 | `--need-first` | `2` | 첫 인식에 필요한 득표수 |
 | `--manual` | off | SPACE 수동 캡처 모드 |
 | `--no-display` | off | 헤드리스(창 없이 콘솔만, 자동 모드) |
-| `--fresh` | off | 시작 전 out 폴더 비우기 |
+| `--keep` | off | out 폴더 누적(기본은 시작 시 자동 비움) |
 | `--limit` | `0` | 종료 시 `--dir` 분류 개수 제한 (0=전체) |
 
 ## 주의

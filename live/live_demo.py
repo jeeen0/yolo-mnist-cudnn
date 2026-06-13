@@ -88,7 +88,7 @@ class LiveSegmenter:
     """
 
     def __init__(self, classify_fn, gap=8, jump=0.35, live_every=1,
-                 vote_window=7, need_change=5, need_first=2, min_present=2):
+                 vote_window=7, need_change=6, need_first=2, min_present=2):
         self.classify_fn = classify_fn
         self.gap = gap
         self.jump = jump
@@ -365,7 +365,7 @@ def main():
                          "(1 = every frame; cheap via the daemon)")
     ap.add_argument("--vote-window", type=int, default=7,
                     help="sliding window (frames) for the majority vote")
-    ap.add_argument("--need-change", type=int, default=5,
+    ap.add_argument("--need-change", type=int, default=6,
                     help="votes a DIFFERENT digit needs in the window to split "
                          "(raise it if one held digit still saves too many PGMs)")
     ap.add_argument("--need-first", type=int, default=2,
@@ -376,8 +376,9 @@ def main():
                     help="SPACE captures the current frame instead of auto-appearance")
     ap.add_argument("--no-display", action="store_true",
                     help="headless: no window, log to console (auto mode only)")
-    ap.add_argument("--fresh", action="store_true",
-                    help="wipe the out folder before starting")
+    ap.add_argument("--keep", action="store_true",
+                    help="keep existing PGMs in the out folder (default: wipe at "
+                         "start so the final --dir count reflects THIS session only)")
     ap.add_argument("--limit", type=int, default=0,
                     help="--dir limit at the end (0 = all saved)")
     args = ap.parse_args()
@@ -385,9 +386,15 @@ def main():
     if not os.path.exists(args.weights):
         print("weights not found:", args.weights); sys.exit(1)
     os.makedirs(args.out, exist_ok=True)
-    if args.fresh:
-        for p in glob.glob(os.path.join(args.out, "*.pgm")):
+    # Wipe by default: otherwise PGMs from earlier runs pile up and the closing
+    # --dir over the folder counts ALL of them (e.g. 6 digits shown -> 180 files
+    # because three prior sessions were still in there). --keep to accumulate.
+    if not args.keep:
+        old = glob.glob(os.path.join(args.out, "*.pgm"))
+        for p in old:
             os.remove(p)
+        if old:
+            print(f"   cleared {len(old)} old PGM(s) from {args.out} (use --keep to accumulate)")
 
     print("loading YOLO:", args.weights)
     model = load_model(args.weights)
