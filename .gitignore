@@ -14,6 +14,8 @@ runs/
 *.engine
 runtime/pgm/*.pgm
 runtime/results/*.csv
+runtime/**/*.pgm
+runtime/**/*.csv
 finetune/weights/
 finetune/weights_v3/
 finetune/mnist_data/

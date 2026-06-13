@@ -140,6 +140,50 @@ Goal: lift video-path robustness further (esp. the faint 6 and untested 8 on vid
 - HARD rules unchanged: init from original .bin, **freeze conv1/conv2** (only ip1/ip2),
   honor the 1/3/5 gate, back up `.bin`, A/B + ship-gate before swapping on the Orin.
 
+## NEXT: live-camera augmentation (desktop, planned — NOT yet implemented)
+Why: `live/live_demo.py` now does REAL-TIME webcam capture for the in-class demo
+(camera -> YOLO -> appearance/rewrite split -> PGM -> mnistCUDNN, same spec as the
+clip path). A live webcam is harsher and far more variable than the rehearsal clips:
+motion/defocus blur, rolling-shutter/perspective skew (digit held at an angle),
+glare + uneven lighting, JPEG/sensor noise, and — because the digit can be anywhere
+and any distance — much wider POSITION and SCALE spread. Train for this on the
+DESKTOP by extending `augment()` in `finetune/finetune_lenet.py` (do it there, then
+A/B + 1/3/5 gate + ship-gate before swapping `.bin` on the Orin — HARD rules from the
+EMNIST section all still apply: init from original `.bin`, freeze conv1/conv2).
+
+NOTE on what survives preprocessing: `preprocess.normalize_to_mnist` re-centers by
+center-of-mass and rescales the digit to a 20px box, so it CANCELS most pure
+translation/uniform-scale. The augmentations that actually matter on the live path
+are the ones that survive normalization — perspective/shear (changes shape), blur,
+contrast/lighting, stroke thickness — PLUS modest position/scale jitter to cover
+imperfect centering and anisotropic (non-uniform x/y) scale from perspective. So
+widen position/scale as the user asked, but lean hardest on shape/photometric.
+
+ADD to `augment()` (on top of the existing rot±14 / scale±18% / shift±2.5 / dilate-
+erode / gblur / exposure×0.75-1.25 / noiseσ0.06). Apply in capture-pipeline ORDER:
+geometric -> blur -> photometric -> compression/noise. Suggested knobs (`*s` scales
+with `strong`):
+  1. WIDER position+scale (user ask): shift ±5px (was 2.5); scale 0.7–1.35 (was
+     0.82–1.18); make x/y scale INDEPENDENT (anisotropic, sx,sy each 0.7–1.3) to
+     mimic foreshortening; rotation ±18°.
+  2. Perspective warp: jitter the 4 corners by ±(3–5)*s px, `cv2.getPerspectiveTransform`
+     + `warpPerspective`, prob ~0.35. Biggest live-vs-clip gap (tilted card/hand).
+  3. Motion blur: random angle 0–180°, line kernel length 3–9px (`cv2.filter2D`
+     with a 1-px-wide line kernel, normalized), prob ~0.3.
+  4. Defocus: widen the existing Gaussian blur to k∈{3,5,7}; optionally a small
+     disk/box blur as a separate ~0.15 branch.
+  5. Uneven lighting / glare: multiply by a smooth random gradient (linear ramp or
+     off-center radial/vignette, range ~0.5–1.3 across the frame), prob ~0.3.
+  6. JPEG/webcam compression: `cv2.imencode('.jpg', q)` with q∈[30,70] then
+     `imdecode` (do this on the uint8 0–255 image, before final clip), prob ~0.3.
+  7. Stronger/heavier sensor noise: keep σ0.06 but allow up to ~0.09, and an
+     occasional salt-and-pepper sprinkle (~0.5% pixels), prob ~0.2.
+Also regenerate the `make_perturbed` STRONG eval set with these so the robustness
+report reflects live conditions. Keep everything clipped to [0,1]; keep `--mult`
+high enough (≥40) that the wider space is actually sampled. Validate: 1/3/5 gate
+must still pass, our 6/8 must not regress, and ideally test against a few real
+webcam grabs saved via `live/live_demo.py` before shipping.
+
 ## Done criteria
 - `01` builds the dataset; `02` produces `best.pt`; Orin builds `best.engine`.
 - `03` turns a multi-digit clip into ONE correct-looking 28x28 PGM per appearance
