@@ -22,7 +22,9 @@ Two demo modes:
   --manual          YOLO box is drawn live; press SPACE to capture+classify the
                     current frame on demand (you control the timing).
 
-On-screen feedback (instant) calls mnistCUDNN --image per capture. When you quit
+On-screen feedback is instant: a persistent `mnistCUDNN --daemon` process loads the
+weights+CUDA context once and classifies each frame in ~3ms (vs ~325ms cold per
+--image), so the shown digit tracks what is held in real time. When you quit
 (press q / ESC), it ALSO runs mnistCUDNN --dir over the whole saved folder and
 prints the official assignment-notice format — that --dir output is the graded one.
 
@@ -205,6 +207,67 @@ def classify_one(binary, pgm):
     return None
 
 
+class PersistentClassifier:
+    """Long-lived mnistCUDNN --daemon process: pay the ~325ms CUDA/cuDNN cold-start
+    ONCE, then classify each PGM in ~3ms (measured 100x faster than per-call
+    --image). This is what lets the live loop classify EVERY frame in real time
+    instead of throttling to one slow call every few frames. Falls back to the
+    cold per-call path if the daemon can't start, so the demo still runs anywhere.
+    """
+
+    def __init__(self, binary):
+        self.binary = binary
+        self.proc = None
+        self.tmp = os.path.join(tempfile.gettempdir(), "live_daemon_tmp.pgm")
+        if not os.path.exists(binary):
+            return
+        try:
+            self.proc = subprocess.Popen(
+                [binary, "--daemon"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1)
+            for line in self.proc.stdout:           # skip init chatter until READY
+                if line.strip() == "READY":
+                    break
+            else:
+                self.proc = None
+        except Exception:
+            self.proc = None
+
+    @property
+    def ok(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def classify_path(self, path):
+        if not self.ok:
+            return classify_one(self.binary, path)   # fallback: cold subprocess
+        try:
+            self.proc.stdin.write(path + "\n"); self.proc.stdin.flush()
+            for line in self.proc.stdout:            # read until the result line
+                if line.startswith("DIGIT="):
+                    d = line.strip().split("=", 1)[1]
+                    return d if d not in ("-1", "") else None
+            self.proc = None
+            return None
+        except Exception:
+            self.proc = None
+            return classify_one(self.binary, path)
+
+    def classify(self, norm):
+        save_pgm(norm, self.tmp)
+        return self.classify_path(self.tmp)
+
+    def close(self):
+        if self.ok:
+            try:
+                self.proc.stdin.write("quit\n"); self.proc.stdin.flush()
+                self.proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+
+
 def run_dir_spec(binary, pgm_dir, limit):
     """Run the official --dir spec harness over the saved folder and echo it."""
     if not os.path.exists(binary):
@@ -284,9 +347,12 @@ def main():
     ap.add_argument("--min-present", type=int, default=2)
     ap.add_argument("--jump", type=float, default=0.35,
                     help="normalized box-center jump that ends an appearance")
-    ap.add_argument("--live-every", type=int, default=5,
+    ap.add_argument("--live-every", type=int, default=1,
                     help="re-classify the held digit every Nth processed frame "
-                         "(drives the live number + same-spot rewrite split)")
+                         "(1 = every frame; cheap via the daemon)")
+    ap.add_argument("--confirm", type=int, default=2,
+                    help="consecutive reads of a new digit needed to switch/split "
+                         "(higher = steadier, lower = snappier)")
     ap.add_argument("--label", default="x",
                     help="digit stamped in the PGM filename (placeholder)")
     ap.add_argument("--manual", action="store_true",
@@ -325,15 +391,14 @@ def main():
     # digit (a) drives the on-screen number so it always reflects what is CURRENTLY
     # shown, and (b) lets the segmenter split a same-spot rewrite (erase 3, write 2
     # in place) that has neither a detection gap nor a center jump — see
-    # LiveSegmenter. The temp PGM lives OUTSIDE --out so it is never graded.
-    live_tmp = os.path.join(tempfile.gettempdir(), "live_demo_tmp.pgm")
+    # LiveSegmenter. Classification goes through a PERSISTENT daemon (~3ms/call)
+    # so we can classify every frame in real time; cold per-call would be ~325ms.
+    clf = PersistentClassifier(args.bin)
+    print(f"   classifier: {'daemon (~3ms/img)' if clf.ok else 'cold --image fallback (~325ms/img)'}")
 
-    def live_classify(norm):
-        save_pgm(norm, live_tmp)
-        return classify_one(args.bin, live_tmp)
-
-    seg = LiveSegmenter(live_classify, gap=args.gap, jump=args.jump,
-                        live_every=args.live_every, min_present=args.min_present)
+    seg = LiveSegmenter(clf.classify, gap=args.gap, jump=args.jump,
+                        live_every=args.live_every, confirm=args.confirm,
+                        min_present=args.min_present)
     fidx = 0
     saved = 0
     last_digit = None
@@ -348,7 +413,7 @@ def main():
         nonlocal saved, last_digit, banner, banner_until
         p = write_pick(pick, args.out, args.label)
         saved += 1
-        digit = classify_one(args.bin, p)
+        digit = clf.classify_path(p)
         if screen_digit is None:
             last_digit = digit if digit is not None else last_digit
         banner = f"saved #{pick['seq']:02d} {os.path.basename(p)} -> {digit}"
@@ -415,6 +480,7 @@ def main():
             if last:
                 handle_pick(last)
         cap.release()
+        clf.close()
         if not headless:
             cv2.destroyAllWindows()
 

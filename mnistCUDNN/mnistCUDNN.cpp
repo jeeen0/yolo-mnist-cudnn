@@ -902,6 +902,47 @@ main(int argc, char* argv[]) {
         exit(0);
     }
 
+    // DAEMON mode: load weights + init the CUDA/cuDNN context ONCE, then loop
+    // reading one PGM path per line from stdin and printing "DIGIT=<d>" per line.
+    // This kills the ~325ms PER-PROCESS cuDNN cold-start that dominates the
+    // single-image (--image) path -- after the one-time warm-up every classify is
+    // sub-ms. Used by the LIVE camera demo (live/live_demo.py) so it can classify
+    // every frame in real time. The forward call is the SAME classify_example
+    // (9 stages, unchanged order); this only adds an stdin input loop, exactly
+    // like --dir loops over a folder. Not part of the graded --dir harness.
+    //   echo runtime/pgm/x.pgm | ./mnistCUDNN --daemon
+    if (checkCmdLineFlag(argc, (const char**)argv, "daemon")) {
+        network_t<float> mnist;
+        Layer_t<float> conv1(1, 20, 5, conv1_bin, conv1_bias_bin, argv[0]);
+        Layer_t<float> conv2(20, 50, 5, conv2_bin, conv2_bias_bin, argv[0]);
+        Layer_t<float> ip1(800, 500, 1, ip1_bin, ip1_bias_bin, argv[0]);
+        Layer_t<float> ip2(500, 10, 1, ip2_bin, ip2_bias_bin, argv[0]);
+
+        g_quiet = true;                 // suppress per-image verbose prints
+
+        // PRE-WARM once with a bundled sample so the first REAL request is hot
+        // (lazy cuDNN kernel load happens here, not on the user's first digit).
+        std::string warm;
+        get_path(warm, first_image, argv[0]);
+        mnist.classify_example(warm.c_str(), conv1, conv2, ip1, ip2);
+
+        std::cout << "READY" << std::endl;   // handshake: init + warm-up done
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line.empty()) continue;
+            // trim trailing CR/whitespace (in case of \r\n input)
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n'
+                                     || line.back() == ' '))
+                line.pop_back();
+            if (line == "quit" || line == "exit") break;
+            int d = mnist.classify_example(line.c_str(), conv1, conv2, ip1, ip2);
+            std::cout << "DIGIT=" << d << std::endl;   // endl flushes for the reader
+        }
+
+        cudaDeviceReset();
+        exit(0);
+    }
+
     // Spec test harness: classify EVERY *.pgm in a folder in ONE process and
     // print INPUT/Result per image, then Total Images, Total Time (MNIST-only,
     // summed in-program latency) and per-digit counts. Weights load once and

@@ -70,8 +70,14 @@ collected '6' and '8' samples recognized.
 - `finetune/finetune_lenet.py` — fine-tune LeNet -> 8 `.bin` (init from original,
   freeze conv1/conv2, augment our 6/8, ship gate). `finetune/eval_extra.py` —
   OOD check on USPS/EMNIST/ARDIS.
-- `mnistCUDNN/mnistCUDNN.cpp` — patched: `LATENCY_MS=`, hardcoded conv algo, and
-  the `--dir` spec-format harness. `mnistCUDNN/` also has Makefile + `.bin` + PGMs.
+- `mnistCUDNN/mnistCUDNN.cpp` — patched: `LATENCY_MS=`, hardcoded conv algo, the
+  `--dir` spec-format harness, and `--daemon` (load once, classify PGM paths from
+  stdin at ~3ms/img — used by the live demo; same 9-stage forward, not graded).
+  `mnistCUDNN/` also has Makefile + `.bin` + PGMs.
+- `live/live_demo.py` — REAL-TIME webcam demo for the in-class live test (camera ->
+  YOLO -> appearance/center-jump/digit-change split -> PGM -> classify -> on quit,
+  `--dir` spec output). Classifies every frame via the `--daemon`; auto + `--manual`
+  modes. See `live/README.md`.
 
 ## Build / run
 - Desktop: `pip install -r requirements.txt`; `python scripts/01_make_dataset.py`;
