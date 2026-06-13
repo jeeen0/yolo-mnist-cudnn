@@ -121,24 +121,104 @@ def load_our(pgm_dir):
     return by
 
 
+def _aniso_affine(ang, sx, sy, cx=14.0, cy=14.0):
+    """2x3 affine: anisotropic scale (sx,sy) about center, then rotate by ang."""
+    R = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+    S = np.array([[sx, 0.0, cx - sx*cx],
+                  [0.0, sy, cy - sy*cy],
+                  [0.0, 0.0, 1.0]], np.float32)
+    R3 = np.vstack([R, [0.0, 0.0, 1.0]]).astype(np.float32)
+    return (R3 @ S)[:2]
+
+
+def _perspective(out, rng, jit):
+    """Warp the 4 image corners by +/-jit px to mimic a tilted card/hand."""
+    src = np.float32([[0, 0], [27, 0], [27, 27], [0, 27]])
+    dst = src + rng.uniform(-jit, jit, src.shape).astype(np.float32)
+    H = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(out, H, (28, 28), flags=cv2.INTER_LINEAR, borderValue=0.0)
+
+
+def _motion_blur(out, rng):
+    """Line kernel at a random angle 0-180deg, length 3-9px (camera/hand motion)."""
+    L = int(rng.choice([3, 5, 7, 9]))
+    k = np.zeros((L, L), np.float32)
+    k[L // 2, :] = 1.0                                  # horizontal line...
+    M = cv2.getRotationMatrix2D((L/2 - 0.5, L/2 - 0.5), rng.uniform(0, 180), 1.0)
+    k = cv2.warpAffine(k, M, (L, L))                    # ...rotated to a random angle
+    s = k.sum()
+    return cv2.filter2D(out, -1, k/s) if s > 0 else out
+
+
+def _lighting(out, rng):
+    """Multiply by a smooth gradient (linear ramp or off-center vignette), ~0.5-1.3."""
+    h, w = out.shape
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    if rng.random() < 0.5:                              # directional linear ramp
+        a = rng.uniform(0, 2*np.pi)
+        d = np.cos(a)*xx + np.sin(a)*yy
+        d = (d - d.min()) / (np.ptp(d) + 1e-6)
+        lo, hi = rng.uniform(0.5, 0.9), rng.uniform(1.0, 1.3)
+        g = lo + (hi - lo) * d
+    else:                                               # off-center radial vignette
+        cx, cy = rng.uniform(0, w), rng.uniform(0, h)
+        r = np.sqrt((xx - cx)**2 + (yy - cy)**2); r /= (r.max() + 1e-6)
+        g = 1.3 - 0.8 * r
+    return out * g.astype(np.float32)
+
+
+def _jpeg(out, rng):
+    """Round-trip through JPEG at q in [30,70] to add webcam/codec blocking."""
+    q = int(rng.integers(30, 71))
+    u8 = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+    ok, enc = cv2.imencode(".jpg", u8, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+    if not ok:
+        return out
+    return cv2.imdecode(enc, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
+
+
 def augment(img01, rng, strong=False):
-    """Video-style perturbation of a 28x28 white-on-black [0,1] image."""
+    """Live-camera-style perturbation of a 28x28 white-on-black [0,1] image.
+
+    Applied in capture-pipeline order: geometric -> blur -> photometric ->
+    compression/noise. preprocess.normalize_to_mnist re-centers/rescales, so the
+    augments that survive (perspective/shear, blur, lighting, stroke) are leaned
+    on hardest, plus modest position/scale jitter for imperfect centering.
+    """
     s = 1.4 if strong else 1.0
-    ang = rng.uniform(-14*s, 14*s)
-    sc = rng.uniform(1 - 0.18*s, 1 + 0.18*s)
-    M = cv2.getRotationMatrix2D((14, 14), ang, sc)
-    M[0, 2] += rng.uniform(-2.5*s, 2.5*s); M[1, 2] += rng.uniform(-2.5*s, 2.5*s)
+    # 1. geometric: rotation + anisotropic (foreshortening) scale + wider shift
+    ang = rng.uniform(-18*s, 18*s)
+    sx = rng.uniform(1 - 0.3*s, 1 + 0.3*s); sy = rng.uniform(1 - 0.3*s, 1 + 0.3*s)
+    sc = rng.uniform(0.7, 1.35)                          # overall scale spread
+    M = _aniso_affine(ang, sx*sc, sy*sc)
+    M[0, 2] += rng.uniform(-5*s, 5*s); M[1, 2] += rng.uniform(-5*s, 5*s)
     out = cv2.warpAffine(img01, M, (28, 28), flags=cv2.INTER_LINEAR, borderValue=0.0)
+    if rng.random() < 0.35:
+        out = _perspective(out, rng, jit=rng.uniform(3, 5)*s)
+    # stroke thickness (dilate/erode) is geometric too
     r = rng.random()
     if r < 0.30:
         out = cv2.dilate(out, np.ones((2, 2), np.float32))
     elif r < 0.50:
         out = cv2.erode(out, np.ones((2, 2), np.float32))
-    if rng.random() < 0.4:
-        k = int(rng.choice([3, 5])); out = cv2.GaussianBlur(out, (k, k), 0)
+    # 2. blur: motion (hand/camera) then defocus (Gaussian)
+    if rng.random() < 0.30:
+        out = _motion_blur(out, rng)
+    if rng.random() < 0.40:
+        k = int(rng.choice([3, 5, 7])); out = cv2.GaussianBlur(out, (k, k), 0)
+    # 3. photometric: global exposure then uneven lighting/glare
     out = out * rng.uniform(0.75, 1.25)
-    if rng.random() < 0.4:
-        out = out + rng.normal(0, 0.06, out.shape).astype(np.float32)
+    if rng.random() < 0.30:
+        out = _lighting(out, rng)
+    out = np.clip(out, 0, 1)
+    # 4. compression then sensor noise (operate on the displayed uint8 image)
+    if rng.random() < 0.30:
+        out = _jpeg(out, rng)
+    if rng.random() < 0.40:
+        out = out + rng.normal(0, rng.uniform(0.06, 0.09), out.shape).astype(np.float32)
+    if rng.random() < 0.20:                              # salt-and-pepper sprinkle
+        m = rng.random(out.shape) < 0.005
+        out[m] = (rng.random(int(m.sum())) < 0.5).astype(np.float32)
     return np.clip(out, 0, 1).astype(np.float32)
 
 
