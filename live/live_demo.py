@@ -44,6 +44,7 @@ import time
 import tempfile
 import argparse
 import subprocess
+from collections import deque, Counter
 
 import cv2
 
@@ -75,23 +76,33 @@ class LiveSegmenter:
     clip logic would then merge both into ONE appearance -> the new digit gets no
     PGM and the screen stays frozen on the old digit.
 
-    So here we additionally classify the held digit on a debounce: when the
-    recognised digit CHANGES (confirmed over `confirm` reads) we close the
-    previous run (saving its best frame) and start a fresh one. Classification is
-    sparse -- every `live_every` processed frames -- because each --image call
-    reloads the mnistCUDNN process; that is fast enough to follow a hand writing,
-    not a per-frame cost. `classify_fn(norm)->str|None` is injected so this stays
-    unit-testable without the binary. update() returns (display_digit, pick|None);
-    `pick` is a save dict {seq,fidx,conf,norm} exactly like the clip segmenter.
+    So here we additionally classify the held digit every frame and VOTE over a
+    sliding window: only when a DIFFERENT digit DOMINATES the window (sustained,
+    not a 1-2 frame flicker) do we close the previous run (saving its best frame)
+    and start a fresh one. The window vote is the key to "one PGM per appearance":
+    a naive "changed for N reads in a row" rule over-splits because a single held
+    digit's per-frame reads jitter, turning one digit into many PGMs.
+    `classify_fn(norm)->str|None` is injected so this stays unit-testable without
+    the binary. update() returns (display_digit, pick|None); `pick` is a save dict
+    {seq,fidx,conf,norm} exactly like the clip segmenter.
     """
 
-    def __init__(self, classify_fn, gap=8, jump=0.35, live_every=5,
-                 confirm=2, min_present=2):
+    def __init__(self, classify_fn, gap=8, jump=0.35, live_every=1,
+                 vote_window=7, need_change=5, need_first=2, min_present=2):
         self.classify_fn = classify_fn
         self.gap = gap
         self.jump = jump
         self.live_every = live_every
-        self.confirm = confirm
+        # Hysteresis on the per-frame classification. Per-frame reads of ONE held
+        # digit flicker (6->8->6 from blur/jitter), so a "2 reads in a row" rule
+        # over-splits: one digit becomes many PGMs. Instead we vote over a sliding
+        # window and only act when a digit DOMINATES it:
+        #   need_first  reads (of `vote_window`) to first recognise a digit
+        #   need_change reads (of `vote_window`) of a DIFFERENT digit to split
+        # need_change is the strict one (raise it if a held digit still over-splits).
+        self.vote_window = vote_window
+        self.need_first = need_first
+        self.need_change = need_change
         self.min_present = min_present
         self.seq = 0
         self._reset()
@@ -105,10 +116,16 @@ class LiveSegmenter:
         self.present = 0
         self.miss = 0
         self.last_cx = None
-        self.run_digit = None        # confirmed digit of the open run
+        self.run_digit = None        # committed (voted) digit of the open run
         self.since_cls = 0
-        self.pending_d = None
-        self.pending_n = 0
+        self.vote = deque(maxlen=self.vote_window)
+
+    def _dominant(self):
+        """Most-common digit in the vote window and its count, or (None, 0)."""
+        if not self.vote:
+            return None, 0
+        d, n = Counter(self.vote).most_common(1)[0]
+        return d, n
 
     def _close(self):
         pick = None
@@ -127,8 +144,7 @@ class LiveSegmenter:
         self.last_cx = cx
         self.run_digit = digit
         self.since_cls = 0
-        self.pending_d = None
-        self.pending_n = 0
+        self.vote = deque(maxlen=self.vote_window)
         fg = float((norm > 40).mean())
         self.best_norm = norm
         self.best_conf = conf
@@ -164,27 +180,24 @@ class LiveSegmenter:
             self.best_score = score
             self.best_conf, self.best_norm, self.best_fidx = conf, norm, fidx
 
-        # (2) sparse classification -> drives the on-screen digit AND content-split
+        # (2) classify + VOTE -> drives the on-screen digit AND the content split.
         self.since_cls += 1
         if self.run_digit is None or self.since_cls >= self.live_every:
             self.since_cls = 0
             d = self.classify_fn(norm)
             if d is not None:
+                self.vote.append(d)
+                dom, cnt = self._dominant()
                 if self.run_digit is None:
-                    self.run_digit = d                 # first attribution
-                elif d != self.run_digit:
-                    # confirm the change over `confirm` reads to ignore a single
-                    # misread, then split: save the old run, open a new one here.
-                    if self.pending_d == d:
-                        self.pending_n += 1
-                    else:
-                        self.pending_d, self.pending_n = d, 1
-                    if self.pending_n >= self.confirm:
-                        pick = self._close()
-                        self._start_run_from(fidx, conf, cx, norm, d)
-                        return d, pick
-                else:
-                    self.pending_d, self.pending_n = None, 0
+                    # first recognition: commit once a digit dominates the window
+                    if cnt >= self.need_first:
+                        self.run_digit = dom
+                elif dom != self.run_digit and cnt >= self.need_change:
+                    # a DIFFERENT digit has dominated for a sustained stretch ->
+                    # genuine rewrite. Close+save the old run, open a new one.
+                    pick = self._close()
+                    self._start_run_from(fidx, conf, cx, norm, dom)
+                    return dom, pick
         return self.run_digit, None
 
     def finalize(self):
@@ -350,9 +363,13 @@ def main():
     ap.add_argument("--live-every", type=int, default=1,
                     help="re-classify the held digit every Nth processed frame "
                          "(1 = every frame; cheap via the daemon)")
-    ap.add_argument("--confirm", type=int, default=2,
-                    help="consecutive reads of a new digit needed to switch/split "
-                         "(higher = steadier, lower = snappier)")
+    ap.add_argument("--vote-window", type=int, default=7,
+                    help="sliding window (frames) for the majority vote")
+    ap.add_argument("--need-change", type=int, default=5,
+                    help="votes a DIFFERENT digit needs in the window to split "
+                         "(raise it if one held digit still saves too many PGMs)")
+    ap.add_argument("--need-first", type=int, default=2,
+                    help="votes a digit needs to be first recognised")
     ap.add_argument("--label", default="x",
                     help="digit stamped in the PGM filename (placeholder)")
     ap.add_argument("--manual", action="store_true",
@@ -397,7 +414,8 @@ def main():
     print(f"   classifier: {'daemon (~3ms/img)' if clf.ok else 'cold --image fallback (~325ms/img)'}")
 
     seg = LiveSegmenter(clf.classify, gap=args.gap, jump=args.jump,
-                        live_every=args.live_every, confirm=args.confirm,
+                        live_every=args.live_every, vote_window=args.vote_window,
+                        need_change=args.need_change, need_first=args.need_first,
                         min_present=args.min_present)
     fidx = 0
     saved = 0
