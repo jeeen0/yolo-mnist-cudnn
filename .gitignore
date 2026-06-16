@@ -44,3 +44,7 @@ __pycache__/
 
 # compiled mnistCUDNN binary (build with: cd mnistCUDNN && make)
 mnistCUDNN/mnistCUDNN
+
+# stray build objects
+mnistCUDNN/*.o
+mnistCUDNN/.vscode/

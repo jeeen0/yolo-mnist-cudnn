@@ -62,8 +62,10 @@ collected '6' and '8' samples recognized.
 - `scripts/01_make_dataset.py` — auto-label photos -> YOLO dataset.
 - `scripts/02_train_yolo.py` — train + export (DESKTOP GPU).
 - `scripts/03_pipeline.py` — video -> YOLO -> crop -> 28x28 PGM (Orin); ONE PGM
-  per digit appearance (gap- OR box-center-jump segmentation; composite frame-pick
-  = centeredness + conf + box-height + ink-fraction guard).
+  per digit appearance (gap- OR box-center-jump segmentation; the jump is DEBOUNCED
+  by `--jump-confirm` N=2 — a single-frame spurious box that reverts no longer
+  over-splits one digit; composite frame-pick = centeredness + conf + box-height +
+  ink-fraction guard). Test clip: `clips/test1.mp4` = 9 4 7 2 0 1.
 - `scripts/04_eval.py` — classify PGMs, per-digit accuracy + latency, 1/3/5 gate.
 - `scripts/gen_test_clip.py` — synthesize a multi-digit pan test clip from the 6/8
   photos (continuous paper-gray strip, pitch~frame-width); writes a `.labels.txt`.
@@ -79,11 +81,40 @@ collected '6' and '8' samples recognized.
   `--dir` spec output). Classifies every frame via the `--daemon`; auto + `--manual`
   modes. See `live/README.md`.
 
+## Submission layout (set 2026-06-15)
+- Project `mnistCUDNN/` IS the submission build: the professor's original `mnistCUDNN (1)/`
+  (renamed) + our patches, built with the PROFESSOR'S Makefile (OLD cuDNN API, no `_v7` —
+  so it compiles in his env). Patches: `Inference time:` timer, conv-algo hardcode,
+  `warmup()` pre-warm, + fine-tune `.bin`. PER-IMAGE `--image` ONLY — NO `--dir`/`--daemon`.
+  Pristine backups kept: `mnistCUDNN.cpp.prof_orig`, `data/orig_mnist_backup/`.
+- The live-camera version (`live/` + the `--daemon` work binary) was MOVED OUT to
+  `~/yolo-live-camera-version/` (self-contained). It is NOT in this repo anymore.
+- Grading = professor runs OUR code in HIS env (per-image, cold ~285ms each). Hand over
+  `mnistCUDNN/` (cpp + Makefile + fine-tune `.bin`) AND the YOLO side
+  (`scripts/03_pipeline.py` + `preprocess.py` + `best.pt`).
+- PROF's actual grading files are in the repo ROOT: `ExampleShell-1.sh` + `Makefile`.
+  The shell runs FROM INSIDE the mnist folder: `EXE=./mnistCUDNN`, `PGM_DIR=pgm_output`,
+  calls `./mnistCUDNN image="$img"` (NO dashes), `head -n 10`, top `answers=()` = ground
+  truth; greps `Result of classification`($4) / `Inference time:`($3). So PGMs must land in
+  `mnistCUDNN/pgm_output/` (point `03 --out` there).
+- GOTCHA: `ExampleShell-1.sh` ships as CRLF -> breaks Linux bash (`$'\r'`); run
+  `sed -i 's/\r$//'` before using it on the Orin.
+- Demo/grading runs on the PROF's own x86_64 Linux desktop, NOT the Orin (we hand over code
+  only). SHIP THE ROOT Makefile (system FreeImage `/usr/lib/x86_64-linux-gnu`, SMS 75 80 86),
+  NOT `mnistCUDNN/Makefile` (Orin-only: local `FreeImage/`, SMS 80 86 -> fails on x86_64).
+- Assembled package lives in `submission/`: mnistCUDNN/ (sources + ROOT Makefile + shell +
+  data/*.bin + 3 example PGMs) and YOLO side (`scripts/03_pipeline.py` + `preprocess.py` at
+  parent so its `sys.path` import works + `best.pt`). Exclude binary/.o/backups/experiment PGMs.
+
 ## Build / run
 - Desktop: `pip install -r requirements.txt`; `python scripts/01_make_dataset.py`;
   `python scripts/02_train_yolo.py`. Copy `best.pt` to the Orin.
 - Orin: build the engine `yolo export model=best.pt format=engine half=True
   device=0`; build mnistCUDNN with `make` in `mnistCUDNN/`; then `./run_all.sh`.
+- `./run_pgm_all.sh [PGM_DIR] [LABELS_FILE]` — local mirror of the prof's grading shell
+  (per-image; prints 정답/추론/Inference time + SUMMARY; LABELS optional for O/X).
+  GOTCHA: mnistCUDNN's get_path is hardcoded `data/<f>` relative to CWD, so run the
+  binary FROM its own folder (the script cd's into it automatically).
 
 ## Latency measurement (source of truth)
 Latency must be the **program's own reported time including H2D/D2H and I/O**.
@@ -92,6 +123,10 @@ The patched mnistCUDNN must print `LATENCY_MS=<float>` covering load->classify
 `04_eval.py` parses that token; until it exists it falls back to wall-clock and
 prints a WARNING — that fallback is a placeholder, not a score. Measure with
 several repeats and report the median (warmup-robust).
+- PROF (2026-06-15) moved the timer to print `Inference time: <ms> ms` around the
+  9-STAGE FORWARD ONLY (start AFTER H2D/setup, stop after the sync, BEFORE D2H).
+  `warmup()` runs one dummy forward BEFORE the timer so cuDNN/cuBLAS lazy-init is
+  untimed -> ~2ms warm. The ~285ms per-image cold number is just lazy-init, not compute.
 
 ## Confirmed facts from the lab slides (lab10) — drive the mnistCUDNN patches
 - Default run does BOTH `Testing single precision` and `Testing half precision`,
@@ -117,6 +152,8 @@ several repeats and report the median (warmup-robust).
    2.94s -> +algo-hardcode 0.71s -> +pre-warm 0.39s -> +buffer-reuse 0.28s = 10.5x.
 
 ## Current status (Orin-validated through 2026-06-12)
+- YOLO inference path imports torch AND torchvision (ultralytics uses `torchvision.ops` for
+  NMS) — both are installed but CPU-only on the Orin. They are NOT used by mnistCUDNN.
 - `02` -> `best.pt` (single-class digit detector, mAP50 ~0.995). YOLO runs on CPU here
   (torch has no CUDA), so the pipeline uses `--weights best.pt`, not `.engine`.
 - Weights: v2 fine-tune is LIVE in `mnistCUDNN/data/*.bin` (committed 82716be). A/B on
@@ -203,8 +240,9 @@ webcam grabs saved via `live/live_demo.py` before shipping.
 1. `python scripts/03_pipeline.py --video clips/<clip>.mp4 --weights best.pt`
    -> one PGM per appearance in `runtime/pgm`. Sanity-check the count == digits shown.
    (YOLO is CPU here; high-fps clips: add `--stride 2/4`. best.engine unavailable.)
-2. `./mnistCUDNN/mnistCUDNN --dir=runtime/pgm --limit=<#digits>` for the spec output;
-   `scripts/04_eval.py` for the 1/3/5 gate + per-digit/latency table.
+2. `rm -f runtime/pgm/*.pgm` first (03 does NOT clear --out -> stale PGMs get counted).
+   Then `./run_pgm_all.sh runtime/pgm [clips/<clip>.mp4.labels.txt]` for per-image spec
+   output. (Project `mnistCUDNN/` is the submission build: `--image` only, no `--dir`.)
 3. If a digit misclassifies -> tune `preprocess.py` knobs or re-run the fine-tune.
    If PGM count is wrong -> tune `03`'s `--gap/--jump/--conf`. If latency is high ->
    next mnistCUDNN latency patch.

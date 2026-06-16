@@ -46,19 +46,16 @@
  * comments to the code, the above Disclaimer and U.S. Government End
  * Users Notice.
  */
+ 
+#include "fp16_emu.h" 
 
-#include "fp16_emu.h"
-
-#define STATIC_ASSERT(cond)                                \
-    do {                                                   \
-        typedef char compile_time_assert[(cond) ? 1 : -1]; \
-    } while (0)
+#define STATIC_ASSERT(cond) do { typedef char compile_time_assert[(cond) ? 1 : -1]; } while (0)
 
 // Host functions for converting between FP32 and FP16 formats
 // Paulius Micikevicius (pauliusm@nvidia.com)
 
-half1
-cpu_float2half_rn(float f) {
+half1 cpu_float2half_rn(float f)
+{
     unsigned x = *((int*)(void*)(&f));
     unsigned u = (x & 0x7fffffff), remainder, shift, lsb, lsb_s1, lsb_m1;
     unsigned sign, exponent, mantissa;
@@ -70,9 +67,9 @@ cpu_float2half_rn(float f) {
         hr.x = 0x7fffU;
         return reinterpret_cast<half1&>(hr);
     }
-
+  
     sign = ((x >> 16) & 0x8000);
-
+  
     // Get rid of +Inf/-Inf, +0/-0.
     if (u > 0x477fefff) {
         hr.x = sign | 0x7c00U;
@@ -90,14 +87,14 @@ cpu_float2half_rn(float f) {
         shift = 13;
         exponent -= 0x70;
     } else {
-        shift    = 0x7e - exponent;
+        shift = 0x7e - exponent;
         exponent = 0;
         mantissa |= 0x800000;
     }
-    lsb    = (1 << shift);
+    lsb = (1 << shift);
     lsb_s1 = (lsb >> 1);
     lsb_m1 = (lsb - 1);
-
+  
     // Round to nearest even.
     remainder = (mantissa & lsb_m1);
     mantissa >>= shift;
@@ -107,15 +104,16 @@ cpu_float2half_rn(float f) {
             ++exponent;
             mantissa = 0;
         }
-    }
+    }  
 
-    hr.x = (sign | (exponent << 10) | mantissa);
+    hr.x = (sign | (exponent << 10) | mantissa);  
 
     return reinterpret_cast<half1&>(hr);
 }
 
-float
-cpu_half2float(half1 h) {
+
+float cpu_half2float(half1 h)
+{
     STATIC_ASSERT(sizeof(int) == sizeof(float));
 
     __half_raw hr = reinterpret_cast<__half_raw&>(h);
@@ -124,19 +122,19 @@ cpu_half2float(half1 h) {
     unsigned exponent = ((hr.x >> 10) & 0x1f);
     unsigned mantissa = ((hr.x & 0x3ff) << 13);
 
-    if (exponent == 0x1f) { /* NaN or Inf */
+    if (exponent == 0x1f) {  /* NaN or Inf */
         mantissa = (mantissa ? (sign = 0, 0x7fffff) : 0);
         exponent = 0xff;
-    } else if (!exponent) { /* Denorm or Zero */
+    } else if (!exponent) {  /* Denorm or Zero */
         if (mantissa) {
             unsigned int msb;
             exponent = 0x71;
             do {
                 msb = (mantissa & 0x400000);
-                mantissa <<= 1; /* normalize */
+                mantissa <<= 1;  /* normalize */
                 --exponent;
             } while (!msb);
-            mantissa &= 0x7fffff; /* 1.mantissa is implicit */
+            mantissa &= 0x7fffff;  /* 1.mantissa is implicit */
         }
     } else {
         exponent += 0x70;
@@ -146,3 +144,4 @@ cpu_half2float(half1 h) {
 
     return reinterpret_cast<float&>(temp);
 }
+

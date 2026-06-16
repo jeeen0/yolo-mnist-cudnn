@@ -422,9 +422,7 @@ class network_t
   public:
     network_t()
     {
-        // 입력이 28x28로 고정 -> 매 호출 cudnnFindConvolutionForwardAlgorithm
-        // 탐색을 돌리지 않고 가장 빠른 알고리즘으로 고정 (측정 구간 단축).
-        convAlgorithm = (int)CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM;  // was -1
+        convAlgorithm = -1;
         switch (sizeof(value_type))
         {
             case 2 : dataType = CUDNN_DATA_HALF; break;
@@ -669,37 +667,6 @@ class network_t
         checkCUDNN( cudnnActivationForward(cudnnHandle, activDesc, &alpha, srcTensorDesc, srcData, &beta, dstTensorDesc, *dstData) );    
     }
 
-    // Pre-warm: 9-stage forward를 더미 입력으로 1회 돌려서 cuDNN/cuBLAS의
-    // lazy 초기화(커널 모듈 로딩)와 conv workspace 할당을 "측정 구간 밖"에서
-    // 끝낸다. classify_example의 타이머(infer_start)가 시작되기 전에 호출하면
-    // 실제 측정 추론은 warm 상태(~ms)가 된다. forward 구조/순서는 그대로,
-    // 출력도 없음(채점 형식 오염 X).
-    void warmup(const Layer_t<value_type>& conv1, const Layer_t<value_type>& conv2,
-                const Layer_t<value_type>& ip1,   const Layer_t<value_type>& ip2)
-    {
-        int n, c, h, w;
-        value_type *srcData = NULL, *dstData = NULL;
-        value_type imgData_h[IMAGE_H*IMAGE_W] = {};   // zero dummy image
-        checkCudaErrors( cudaMalloc((void**)&srcData, IMAGE_H*IMAGE_W*sizeof(value_type)) );
-        checkCudaErrors( cudaMemcpy(srcData, imgData_h,
-                                    IMAGE_H*IMAGE_W*sizeof(value_type), cudaMemcpyHostToDevice) );
-        for (int it = 0; it < 2; ++it) {
-            n = c = 1; h = IMAGE_H; w = IMAGE_W;
-            convoluteForward(conv1, n, c, h, w, srcData, &dstData);
-            poolForward(n, c, h, w, dstData, &srcData);
-            convoluteForward(conv2, n, c, h, w, srcData, &dstData);
-            poolForward(n, c, h, w, dstData, &srcData);
-            fullyConnectedForward(ip1, n, c, h, w, srcData, &dstData);
-            activationForward(n, c, h, w, dstData, &srcData);
-            lrnForward(n, c, h, w, srcData, &dstData);
-            fullyConnectedForward(ip2, n, c, h, w, dstData, &srcData);
-            softmaxForward(n, c, h, w, srcData, &dstData);
-        }
-        checkCudaErrors( cudaDeviceSynchronize() );
-        if (srcData) checkCudaErrors( cudaFree(srcData) );
-        if (dstData) checkCudaErrors( cudaFree(dstData) );
-    }
-
     int classify_example(const char* fname, const Layer_t<value_type>& conv1,
                           const Layer_t<value_type>& conv2,
                           const Layer_t<value_type>& ip1,
@@ -719,10 +686,6 @@ class network_t
                                     cudaMemcpyHostToDevice) );
 
         n = c = 1; h = IMAGE_H; w = IMAGE_W;
-
-        // 추론 시간 측정 시작 (초기 setup/H2D 제외, 9-stage forward만)
-        auto infer_start = std::chrono::high_resolution_clock::now();
-
         convoluteForward(conv1, n, c, h, w, srcData, &dstData);
         poolForward(n, c, h, w, dstData, &srcData);
 
@@ -739,13 +702,6 @@ class network_t
         //cuDNN and cuBLAS library calls are asynchronous w.r.t. the host.
         // Need a device sync here before copying back the results.
         checkCudaErrors (cudaDeviceSynchronize());
-
-        // 추론 시간 측정 종료 (forward 동기화 직후, D2H 복사 전)
-        auto infer_end = std::chrono::high_resolution_clock::now();
-        double infer_ms =
-            std::chrono::duration<double, std::milli>(infer_end - infer_start).count();
-        std::cout << "Inference time: " << infer_ms << " ms" << std::endl;
-
         const int max_digits = 10;
         // Take care of half precision
         Convert<scaling_type> toReal;
@@ -848,8 +804,6 @@ int main(int argc, char *argv[])
         Layer_t<float> conv2(20,50,5,conv2_bin,conv2_bias_bin,argv[0]);
         Layer_t<float>   ip1(800,500,1,ip1_bin,ip1_bias_bin,argv[0]);
         Layer_t<float>   ip2(500,10,1,ip2_bin,ip2_bias_bin,argv[0]);
-        // 측정 전 pre-warm: cuDNN/cuBLAS 초기화를 측정 구간 밖에서 끝낸다.
-        mnist.warmup(conv1, conv2, ip1, ip2);
         int i1 = mnist.classify_example(image_name, conv1, conv2, ip1, ip2);
         std::cout << "\nResult of classification: " << i1 << std::endl;
 

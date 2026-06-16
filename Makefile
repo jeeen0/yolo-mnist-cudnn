@@ -78,7 +78,7 @@ endif
 HOST_COMPILER ?= g++
 #MY CODE START
 # NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
-NVCC := /usr/local/cuda/bin/nvcc
+NVCC := /usr/local/cuda/bin/nvcc -ccbin $(HOST_COMPILER)
 #MY CODE END
 
 # internal flags
@@ -145,11 +145,11 @@ LIBRARIES :=
 ################################################################################
 
 # Gencode arguments
-SMS := 80 86 87
+SMS ?= 30 35 50 53
 
 ifeq ($(SMS),)
 $(info >>> WARNING - no SM architectures have been specified - waiving sample <<<)
-SAMPLE_ENABLED := 0
+SAMPLE_ENABLED := 1
 endif
 
 # MY CODE START
@@ -163,7 +163,9 @@ endif
 # GENCODE_FLAGS += -gencode arch=compute_$(HIGHEST_SM),code=compute_$(HIGHEST_SM)
 # endif
 # endif
-SMS := 80 86  # 추가
+#SMS := 75
+
+SMS := 75 80 86
 
 ifeq ($(GENCODE_FLAGS),)
 # Generate SASS code for each SM architecture listed in $(SMS)
@@ -177,8 +179,8 @@ endif
 endif
 # MY CODE END
 
-INCLUDES += -IFreeImage/include
-LIBRARIES += -LFreeImage/lib/$(TARGET_OS)/$(TARGET_ARCH) -LFreeImage/lib/$(TARGET_OS) -lcudart -lcublas -lcudnn -lfreeimage -lstdc++ -lm
+INCLUDES += -I/usr/include
+LIBRARIES += -L/usr/lib/x86_64-linux-gnu -lcudart -lcublas -lcudnn -lfreeimage -lstdc++ -lm
 
 # Attempt to compile a minimal application linked against FreeImage. If a.out exists, FreeImage is properly set up.
 $(shell echo "#include \"FreeImage.h\"" > test.c; echo "int main() { return 0; }" >> test.c ; $(NVCC) $(ALL_CCFLAGS) $(INCLUDES) $(LIBRARIES) -l freeimage test.c)
@@ -187,7 +189,7 @@ $(shell rm a.out test.c 2>/dev/null)
 
 ifeq ("$(FREEIMAGE)","")
 $(info >>> WARNING - FreeImage is not set up correctly. Please ensure FreeImage is set up correctly. <<<)
-SAMPLE_ENABLED := 0
+SAMPLE_ENABLED := 1
 endif
 
 ifeq ($(SAMPLE_ENABLED),0)

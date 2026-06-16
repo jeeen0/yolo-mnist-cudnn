@@ -71,11 +71,19 @@ class AppearanceSegmenter:
     Pure (no I/O) so the segmentation can be unit-tested without a video.
     """
 
-    def __init__(self, gap=8, min_present=2, min_conf=0.0, jump=0.35):
+    def __init__(self, gap=8, min_present=2, min_conf=0.0, jump=0.35,
+                 jump_confirm=2):
         self.gap = gap                  # absent frames that end an appearance
         self.min_present = min_present  # reject blips shorter than this
         self.min_conf = min_conf
         self.jump = jump                # box-center jump that ends an appearance
+        self.jump_confirm = jump_confirm  # frames the jumped-to center must HOLD
+                                          # before the jump counts as a real
+                                          # boundary -- debounces a single-frame
+                                          # spurious box (max-conf momentarily
+                                          # flips to a stray detection elsewhere,
+                                          # then reverts) that would otherwise
+                                          # over-split one digit into two.
         self.seq = 0
         self._reset()
 
@@ -88,6 +96,27 @@ class AppearanceSegmenter:
         self.present = 0
         self.miss = 0
         self.last_cx = None
+        self._clear_pending()
+
+    def _clear_pending(self):
+        self.pend_cx = None        # candidate new-appearance center, unconfirmed
+        self.pend = []             # frames buffered at that center while we wait
+
+    def _add(self, fidx, conf, cx, norm, bh):
+        """Fold one present frame into the current appearance + update the pick."""
+        self.active = True
+        self.miss = 0
+        self.present += 1
+        # pick the BEST-LOOKING frame via a composite of centeredness, confidence,
+        # box height (full digit in view) and ink-fraction plausibility -- more
+        # robust than centeredness alone (see _pick_score).
+        fg = float((norm > 40).mean())
+        score = _pick_score(cx, conf, fg, bh)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_conf, self.best_norm, self.best_fidx = conf, norm, fidx
+        if cx is not None:
+            self.last_cx = cx
 
     def _close(self):
         pick = None
@@ -99,32 +128,54 @@ class AppearanceSegmenter:
         self._reset()
         return pick
 
+    def _start_from(self, buf):
+        """Begin a fresh appearance seeded with the buffered (held) frames."""
+        for (fidx, conf, cx, norm, bh) in buf:
+            self._add(fidx, conf, cx, norm, bh)
+
     def update(self, fidx, conf, cx, norm, bh=0.0):
-        if norm is not None:                       # digit present this frame
-            boundary = None
-            if (self.active and cx is not None and self.last_cx is not None
-                    and abs(cx - self.last_cx) > self.jump):
-                boundary = self._close()           # center teleported -> new digit
-            self.active = True
-            self.miss = 0
-            self.present += 1
-            # pick the BEST-LOOKING frame via a composite of centeredness,
-            # confidence, box height (full digit in view) and ink-fraction
-            # plausibility -- more robust than centeredness alone (see _pick_score).
-            fg = float((norm > 40).mean())
-            score = _pick_score(cx, conf, fg, bh)
-            if score > self.best_score:
-                self.best_score = score
-                self.best_conf, self.best_norm, self.best_fidx = conf, norm, fidx
-            self.last_cx = cx
-            return boundary
-        if self.active:                            # nothing detected this frame
-            self.miss += 1
-            if self.miss >= self.gap:
-                return self._close()
+        if norm is None:                           # nothing detected this frame
+            if self.active:
+                self.miss += 1
+                if self.miss >= self.gap:          # real gap -> close (drops pending)
+                    return self._close()
+            return None
+
+        if not self.active:                        # first frame of an appearance
+            self._add(fidx, conf, cx, norm, bh)
+            return None
+
+        jumped = (cx is not None and self.last_cx is not None
+                  and abs(cx - self.last_cx) > self.jump)
+
+        if self.pend_cx is not None:               # a candidate boundary is pending
+            if cx is not None and abs(cx - self.pend_cx) <= self.jump:
+                self.pend.append((fidx, conf, cx, norm, bh))   # holds at new center
+                if len(self.pend) >= self.jump_confirm:        # CONFIRMED boundary
+                    buf = self.pend
+                    closed = self._close()         # close current (pre-jump frames)
+                    self._start_from(buf)          # new appearance = held frames
+                    return closed
+                return None
+            if not jumped:                         # reverted -> pending was noise
+                self._clear_pending()
+                self._add(fidx, conf, cx, norm, bh)
+                return None
+            self.pend_cx = cx                      # jumped elsewhere again -> restart
+            self.pend = [(fidx, conf, cx, norm, bh)]
+            return None
+
+        if jumped:                                 # new jump -> start pending, wait
+            self.pend_cx = cx
+            self.pend = [(fidx, conf, cx, norm, bh)]
+            return None
+
+        self._add(fidx, conf, cx, norm, bh)        # normal continuation
         return None
 
     def finalize(self):
+        # A pending tail at EOF never reached jump_confirm (< confirm frames), so
+        # it's below min_present and not a real appearance -- drop it, close current.
         return self._close() if self.active else None
 
 
@@ -162,12 +213,14 @@ def write_pick(pick, out_dir, label):
     return path
 
 
-def process_video(model, path, out_dir, conf, stride, gap, min_present, jump, label):
+def process_video(model, path, out_dir, conf, stride, gap, min_present, jump,
+                  label, jump_confirm=2):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         print("could not open", path)
         return 0
-    seg = AppearanceSegmenter(gap=gap, min_present=min_present, jump=jump)
+    seg = AppearanceSegmenter(gap=gap, min_present=min_present, jump=jump,
+                              jump_confirm=jump_confirm)
     written, fidx = 0, 0
     while True:
         ok, frame = cap.read()
@@ -209,6 +262,10 @@ def main():
                     help="reject appearances shorter than this many frames")
     ap.add_argument("--jump", type=float, default=0.35,
                     help="normalized box-center jump that ends an appearance")
+    ap.add_argument("--jump-confirm", type=int, default=2,
+                    help="frames the jumped-to center must hold before a jump "
+                         "counts as a boundary (debounces single-frame box noise "
+                         "that over-splits one digit; 1 = old immediate behavior)")
     ap.add_argument("--label", default="x",
                     help="digit stamped in the filename (single-class YOLO "
                          "doesn't know it; default placeholder 'x')")
@@ -229,7 +286,8 @@ def main():
     total = 0
     for v in vids:
         total += process_video(model, v, args.out, args.conf, args.stride,
-                               args.gap, args.min_present, args.jump, args.label)
+                               args.gap, args.min_present, args.jump, args.label,
+                               jump_confirm=args.jump_confirm)
     print(f"\nwrote {total} appearance PGM(s) to {args.out}")
 
 
